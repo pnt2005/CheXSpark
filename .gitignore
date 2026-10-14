@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Env & secrets
+.env
+
+# Data lake (Bronze/Silver/Gold layers are stored in MinIO, local copies ignored)
+data/bronze/
+data/silver/
+data/gold/
+data/raw/
+*.parquet
+*.csv
+*.dcm
+
+# ML artifacts
+mlruns/
+mlartifacts/
+*.h5
+*.pt
+*.onnx
+checkpoints/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Spark
+derby.log
+metastore_db/
+spark-warehouse/
+
+# Docker volumes (local bind mounts)
+infra/postgres/data/
+infra/minio/data/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

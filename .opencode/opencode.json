@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/schema/opencode.json",
+  "name": "CheXSpark",
+  "version": "1.0.0",
+  "description": "CheXSpark: Multi-Pathology Chest X-Ray Detection & Visualization System using Deep Learning and Apache Spark.",
+  "defaultAgent": "chexspark-engineer",
+  "skillsPath": "./.opencode/skills",
+  "agentsPath": "./.opencode/agents",
+  "mcpConfig": "./.opencode/mcp.json"
+}

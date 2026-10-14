@@ -38,6 +38,10 @@ spark-warehouse/
 infra/postgres/data/
 infra/minio/data/
 
+# Local documents (not for repo)
+nội dung.docx
+*.docx
+
 # IDE / OS
 .vscode/
 .idea/

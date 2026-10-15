@@ -10,13 +10,14 @@ venv/
 .env
 
 # Data lake (Bronze/Silver/Gold layers are stored in MinIO, local copies ignored)
-data/bronze/
-data/silver/
-data/gold/
-data/raw/
+data/
 *.parquet
 *.csv
 *.dcm
+*.zip
+
+# Spark build artifacts (jar tự tải during docker build, không commit)
+infra/spark/jars/
 
 # ML artifacts
 mlruns/

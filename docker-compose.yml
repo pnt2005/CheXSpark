@@ -14,28 +14,31 @@ x-minio-creds: &minio-creds
 services:
   # ─────────────────────────── MinIO (S3-compatible object storage) ───────────────────────────
   minio:
-    image: quay.io/minio/minio:latest
+    image: bitnamilegacy/minio:latest
     container_name: chexspark-minio
-    command: server /data --console-address ":9001"
+    # Bitnami run.sh tự chạy: minio server --console-address :9001 --address :9000 /bitnami/minio/data
     environment:
       <<: *minio-env
+      MINIO_API_PORT_NUMBER: "9000"
+      MINIO_CONSOLE_PORT_NUMBER: "9001"
+      MINIO_DATA_DIR: /bitnami/minio/data
     ports:
       - "${MINIO_API_PORT:-9000}:9000"   # S3 API
       - "${MINIO_CONSOLE_PORT:-9001}:9001" # Web console
     volumes:
-      - minio-data:/data
+      - minio-data:/bitnami/minio/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 15s
     networks: [chexspark-net]
     restart: unless-stopped
 
   # Tạo bucket "mlflow" (artifact store) sau khi MinIO sẵn sàng
   minio-init:
-    image: quay.io/minio/mc:latest
+    image: bitnamilegacy/minio-client:latest
     container_name: chexspark-minio-init
     depends_on:
       minio:
@@ -75,7 +78,8 @@ services:
 
   # ─────────────────────────── Spark Master ───────────────────────────
   spark-master:
-    image: apache/spark:3.5.1
+    build: ./infra/spark
+    image: chexspark-spark:3.5.1
     container_name: chexspark-spark-master
     hostname: spark-master
     user: root
@@ -106,7 +110,8 @@ services:
 
   # ─────────────────────────── Spark Worker 1 ───────────────────────────
   spark-worker-1:
-    image: apache/spark:3.5.1
+    build: ./infra/spark
+    image: chexspark-spark:3.5.1
     container_name: chexspark-spark-worker-1
     hostname: spark-worker-1
     user: root
@@ -141,7 +146,8 @@ services:
 
   # ─────────────────────────── Spark Worker 2 ───────────────────────────
   spark-worker-2:
-    image: apache/spark:3.5.1
+    build: ./infra/spark
+    image: chexspark-spark:3.5.1
     container_name: chexspark-spark-worker-2
     hostname: spark-worker-2
     user: root

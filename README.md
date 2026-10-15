@@ -8,13 +8,18 @@ Xây dựng hệ thống phát hiện và trực quan hóa đa bệnh lý lồng
 
 | Service | Image | Port(s) | Vai trò |
 |---|---|---|---|
-| **minio** | quay.io/minio/minio | 9000 (S3), 9001 (console) | Object storage: ảnh CXR, mask CheXmask, Silver/Gold datasets |
-| **minio-init** | quay.io/minio/mc | — | Tạo bucket `mlflow` tự động khi khởi động |
+| **minio** | bitnamilegacy/minio | 9000 (S3), 9001 (console) | Object storage: ảnh CXR, mask CheXmask, Silver/Gold datasets |
+| **minio-init** | bitnamilegacy/minio-client | — | Tạo bucket `mlflow` tự động khi khởi động |
 | **postgres** | postgres:16-alpine | 5432 | Metadata catalog + backend store cho MLflow |
-| **spark-master** | apache/spark:3.5.1 | 7077, 8080 | Spark standalone master |
-| **spark-worker-1** | apache/spark:3.5.1 | 8081 | Worker (cores/memory cấu hình qua `.env`) |
-| **spark-worker-2** | apache/spark:3.5.1 | 8082 | Worker |
+| **spark-master** | **chexspark-spark:3.5.1** (build local) | 7077, 8080 | Spark standalone master (S3A jars + mlflow) |
+| **spark-worker-1** | **chexspark-spark:3.5.1** | 8081 | Worker (cores/memory cấu hình qua `.env`) |
+| **spark-worker-2** | **chexspark-spark:3.5.1** | 8082 | Worker |
 | **mlflow** | ghcr.io/mlflow/mlflow | 5000 | Experiment tracking + model registry |
+
+> **Lưu ý image**: `apache/spark` mặc định **không kèm S3A jars** (không đọc được MinIO) và **không có mlflow**.
+> Vì vậy ta build image riêng `chexspark-spark:3.5.1` từ `infra/spark/Dockerfile`, thêm
+> `hadoop-aws` + `aws-java-sdk-bundle` (đọc/ghi MinIO) và cài `mlflow==2.9.2` (khớp server).
+> Image MinIO dùng bản `bitnamilegacy` do `minio/minio` trên Docker Hub đã bị restrict.
 
 ## Cấu trúc repo
 
@@ -24,16 +29,21 @@ CheXSpark/
 ├── .env.example                  # Biến môi trường (copy → .env trước khi chạy)
 ├── infra/
 │   ├── postgres/init/            # SQL bootstrap (tạo DB mlflow, chexspark_metadata)
-│   └── spark/conf/               # spark-defaults.conf (S3/MinIO, MLflow URI)
+│   └── spark/
+│       ├── Dockerfile            # Build image chexspark-spark (S3A jars + mlflow)
+│       ├── jars/                 # hadoop-aws + aws-java-sdk-bundle (cho S3A/MinIO)
+│       └── conf/                 # spark-defaults.conf (S3/MinIO, MLflow URI)
 ├── src/
-│   ├── ingestion/                # Spark Core: đọc CSV metadata + ảnh từ MinIO → Bronze
-│   ├── silver/                   # Spark SQL: cleaning, stratified split → Silver (Parquet)
-│   ├── gold/                     # GraphX co-occurrence, MLlib PCA/K-Means/LR/RF → Gold
+│   ├── common/spark_session.py   # SparkSession factory (dùng chung mọi job)
+│   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, verify)
+│   ├── silver/                   # (sẵn sàng) cleaning, stratified split
+│   ├── gold/                     # GraphX co-occurrence, MLlib PCA/K-Means/LR/RF
 │   ├── dl/                       # U-Net, DenseNet121, Grad-CAM (PyTorch)
 │   └── serving/                  # FastAPI inference + Streamlit UI
 ├── notebooks/                    # Exploration & visualization notebooks
 ├── tests/                        # Unit & integration tests
-└── scripts/                      # Helper scripts (submit jobs, seed data…)
+└── scripts/
+    └── dev/extract_subset.py     # Trích subset ảnh từ zip NIH
 ```
 
 ## Cách chạy
@@ -62,7 +72,7 @@ docker compose ps
 docker compose exec spark-master /opt/spark/bin/spark-submit `
   --master spark://spark-master:7077 `
   --deploy-mode client `
-  /opt/spark/user-src/ingestion/example_job.py
+  /opt/spark/user-src/ingestion/ingest_bronze_to_silver.py
 ```
 
 ### Dọn dẹp
@@ -71,6 +81,65 @@ docker compose exec spark-master /opt/spark/bin/spark-submit `
 docker compose down          # dừng services, giữ data volumes
 docker compose down -v       # xóa hoàn toàn (kể cả MinIO/Postgres data)
 ```
+
+---
+
+## Giai đoạn DEV — chạy end-to-end trên 2k ảnh
+
+Mục tiêu: kiểm chứng trọn pipeline **Bronze → Silver → (sẵn sàng cho DL)** trên quy mô nhỏ,
+đảm bảo Spark cluster đọc/ghi MinIO (S3A) và log MLflow hoạt động trước khi mở rộng.
+
+### 1. Tải dữ liệu nguồn (NIH ChestX-ray14)
+
+Dataset đầy đủ ~42GB (112k ảnh). Giai đoạn DEV chỉ cần **1 part zip (~1.9GB, 10k ảnh)** +
+metadata CSV (~9MB). Dùng mirror HuggingFace `alkzar90/NIH-Chest-X-ray-dataset` (direct download, resumable):
+
+```powershell
+# Metadata CSV (112k rows, nhãn 14 bệnh + Patient ID)
+curl.exe -L -o data/raw/metadata/Data_Entry_2017_v2020.csv `
+  "https://huggingface.co/datasets/alkzar90/NIH-Chest-X-ray-dataset/resolve/main/data/Data_Entry_2017_v2020.csv"
+
+# 1 part ảnh (images_001.zip ~1.9GB, ~10k ảnh PNG 1024x1024)
+curl.exe -L --continue-at - -o data/raw/images/images_001.zip `
+  "https://huggingface.co/datasets/alkzar90/NIH-Chest-X-ray-dataset/resolve/main/data/images/images_001.zip"
+```
+
+### 2. Trích 2k ảnh + dựng Bronze trong MinIO
+
+```powershell
+# Trích 2k ảnh PNG thật (lọc file AppleDouble '._' trong zip)
+python scripts/dev/extract_subset.py --zip data/raw/images/images_001.zip --out data/bronze/images --limit 2000
+
+# Tạo bucket + upload ảnh, metadata, manifest vào MinIO (xem scripts/dev/ + mc)
+# (chi tiết các lệnh mc cp nằm trong section phát triển)
+```
+
+Layer **Bronze** sau bước này:
+- `bronze/images/` — 2000 PNG ảnh X-quang
+- `bronze/metadata/Data_Entry_2017_v2020.csv` — metadata 112k dòng
+- `bronze/images_manifest/images_manifest.csv` — danh sách 2k ảnh đã materialize
+
+### 3. Chạy ingestion Bronze → Silver (Spark + MLflow)
+
+```powershell
+# Job Spark: đọc 112k metadata từ MinIO, join manifest 2k, patient-level split,
+# ghi Silver Parquet partition theo split, log thống kê lên MLflow
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/ingestion/ingest_bronze_to_silver.py
+
+# Verify Silver: đọc lại Parquet, in schema + đếm theo split
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/ingestion/verify_silver.py
+```
+
+**Kết quả đã ghi nhận** (thống kê trên full 112k metadata — khớp số liệu NIH công bố):
+- `full_total_images: 112,120`, `full_total_patients: 30,805`, comorbidity (≥2 bệnh): 20,796
+- Per-label: Atelectasis 11559, Infiltration 19894, Effusion 13317, Cardiomegaly 2776, Hernia 227…
+- Dev subset: 2000 ảnh / 648 bệnh nhân → train 1335 · val 321 · test 344 (patient-level, không rò rỉ)
+- Silver: `s3a://silver/cxr14/split={train,val,test}/*.parquet` (schema: 14 cột `label_*` binary + `image_uri` + `split`)
+- MLflow: experiment `chexspark-silver-ingestion`, 23 metrics/run → http://localhost:5000
 
 ## Ghi chú
 

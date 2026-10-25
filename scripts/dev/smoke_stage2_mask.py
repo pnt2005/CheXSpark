@@ -37,8 +37,8 @@ def main() -> None:
             continue
         img = Image.open(img_path).convert("L").resize((IMG_SIZE, IMG_SIZE))
         img_a = np.array(img).astype(np.float32) / 255.0
-        h, w = int(r["Height"]), int(r["Width"])
-        lung = decode_rle(r["Left Lung"], h, w) | decode_rle(r["Right Lung"], h, w)
+        h, w = int(r["mask_height"]), int(r["mask_width"])
+        lung = decode_rle(r["mask_left_rle"], h, w) | decode_rle(r["mask_right_rle"], h, w)
         m = (
             np.array(
                 Image.fromarray((lung * 255).astype(np.uint8)).resize(

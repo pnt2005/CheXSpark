@@ -35,15 +35,16 @@ CheXSpark/
 │       └── conf/                 # spark-defaults.conf (S3/MinIO, MLflow URI)
 ├── src/
 │   ├── common/spark_session.py   # SparkSession factory (dùng chung mọi job)
-│   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, verify)
+│   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, mask join, verify)
 │   ├── silver/                   # (sẵn sàng) cleaning, stratified split
 │   ├── gold/                     # GraphX co-occurrence, MLlib PCA/K-Means/LR/RF
 │   ├── dl/                       # U-Net, DenseNet121, Grad-CAM (PyTorch)
 │   └── serving/                  # FastAPI inference + Streamlit UI
-├── notebooks/                    # Exploration & visualization notebooks
+├── notebooks/
+│   └── kaggle/stage2_densenet121.ipynb   # Train Stage-2 trên Kaggle GPU
 ├── tests/                        # Unit & integration tests
 └── scripts/
-    └── dev/extract_subset.py     # Trích subset ảnh từ zip NIH
+    └── dev/                      # extract_subset, export Silver→Kaggle, smoke tests
 ```
 
 ## Cách chạy
@@ -140,6 +141,63 @@ docker compose exec -T spark-master /opt/spark/bin/spark-submit `
 - Dev subset: 2000 ảnh / 648 bệnh nhân → train 1335 · val 321 · test 344 (patient-level, không rò rỉ)
 - Silver: `s3a://silver/cxr14/split={train,val,test}/*.parquet` (schema: 14 cột `label_*` binary + `image_uri` + `split`)
 - MLflow: experiment `chexspark-silver-ingestion`, 23 metrics/run → http://localhost:5000
+
+### 4. Mask ETL — CheXmask join vào Silver (Spark)
+
+Mask phổi CheXmask (RLE, file ~2GB / 112k rows) được đưa vào **Bronze** rồi join
+với Silver bằng **Spark** — đúng tinh thần AGENTS.md: *"Silver: map chuẩn hóa
+Image ID giữa ảnh và mask"*.
+
+```powershell
+# 4a. Tải CheXmask (mirror HuggingFace — PhysioNet throttle ~5.6 KB/s, HF ~9 MB/s)
+curl.exe -L --continue-at - -o data/raw/chexmask/ChestX-Ray8.csv `
+  "https://huggingface.co/datasets/ming0100/chexmask/resolve/main/OriginalResolution/ChestX-Ray8.csv"
+
+# 4b. Upload vào Bronze (2GB, ~20s qua mạng local Docker)
+docker run --rm --network chexspark_chexspark-net `
+  -v "D:\BigData\CheXSpark\data\raw\chexmask:/data:ro" --entrypoint sh `
+  bitnamilegacy/minio-client:latest -c `
+  "mc alias set local http://minio:9000 $env:MINIO_ROOT_USER $env:MINIO_ROOT_PASSWORD; mc cp /data/ChestX-Ray8.csv local/bronze/chexmask/ChestX-Ray8.csv"
+
+# 4c. Job Spark join mask (đọc 112k rows phân tán → filter broadcast → 2k → ghi Silver mới)
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/ingestion/ingest_chexmask_to_silver.py
+
+# 4d. Verify Silver masked (path truyền qua argv[1])
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/ingestion/verify_silver.py s3a://silver/cxr14_masked
+```
+
+**Kết quả mask join:**
+- Silver mới `s3a://silver/cxr14_masked/` — schema **33 cột** = 25 cũ + 7 cột mask
+  (`dice_rca_mean/max`, `mask_left/right/heart_rle`, `mask_height/width`) + `chexmask_ingested_at`
+- Join **2,000/2,000 (thiếu mask: 0)**, split giữ nguyên 1335/321/344
+- Chất lượng: mean Dice RCA **0.841**, 1,979/2,000 (99%) đạt ngưỡng ≥ 0.7
+- MLflow: experiment `chexspark-silver-mask-join`
+- **Lưu ý kỹ thuật**: RLE strings ~780MB qua shuffle gây OOM cluster 8GB nếu giữ
+  112k rows → job filter về 2k rows **ngay lúc đọc** (broadcast join) trước mọi cache/agg;
+  submit với `--driver-memory 2g --conf spark.executor.memory=2g`
+- RLE CheXmask dạng **cặp `(start, length)`**, reshape row-major (order=`'C'`) —
+  đã validate bằng bounding-box so với cột Landmarks
+
+### 5. Export dữ liệu Stage-2 cho Kaggle
+
+```powershell
+# Copy Parquet masked từ MinIO về local
+docker run --rm --network chexspark_chexspark-net `
+  -v "D:\BigData\CheXSpark\data\tmp\silver_masked:/out" --entrypoint sh `
+  bitnamilegacy/minio-client:latest -c `
+  "mc alias set local http://minio:9000 $env:MINIO_ROOT_USER $env:MINIO_ROOT_PASSWORD; mc cp --recursive local/silver/cxr14_masked /out/"
+
+# Export → stage2_train.csv (labels + RLE mask trong 1 file) + Kaggle metadata
+python scripts/dev/export_silver_masked_to_kaggle.py
+```
+
+Output `data/kaggle/stage2-nih-dev/` (upload lên Kaggle làm dataset) — gắn kèm
+`notebooks/kaggle/stage2_densenet121.ipynb` + dataset ảnh
+`khanfashee/nih-chest-x-ray-14-224x224-resized` để train Stage-2.
 
 ## Ghi chú
 

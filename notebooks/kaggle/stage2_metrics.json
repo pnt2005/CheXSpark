@@ -1,0 +1,26 @@
+{
+  "best_val_auc": 0.6752126382438713,
+  "test_auc": 0.6268636660990287,
+  "per_label_auc": {
+    "Cardiomegaly": 0.8411764705882353,
+    "Atelectasis": 0.7496716371783976,
+    "Fibrosis": 0.7090402045084825,
+    "Mass": 0.6914454277286136,
+    "Infiltration": 0.6604877483635521,
+    "Pleural_Thickening": 0.6597402597402597,
+    "Consolidation": 0.6417910447761195,
+    "Effusion": 0.6196394686907021,
+    "Pneumothorax": 0.6055640243902439,
+    "Edema": 0.5862573099415205,
+    "Pneumonia": 0.46417973717676975,
+    "Emphysema": 0.4613598673300166,
+    "Nodule": 0.4588744588744589,
+    "Hernia": null
+  },
+  "config": {
+    "img_size": 224,
+    "epochs": 8,
+    "lr": 0.0001,
+    "mask_mode": "lungs"
+  }
+}

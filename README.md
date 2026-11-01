@@ -199,6 +199,100 @@ Output `data/kaggle/stage2-nih-dev/` (upload lên Kaggle làm dataset) — gắn
 `notebooks/kaggle/stage2_densenet121.ipynb` + dataset ảnh
 `khanfashee/nih-chest-x-ray-14-224x224-resized` để train Stage-2.
 
+### 6. Gold layer — phân tích dịch tễ & mạng bệnh lý (Spark)
+
+Gold layer chạy trên **full metadata 112,120 ảnh** (không chỉ 2k dev) nên các con
+số thống kê/đồ thị dùng trực tiếp cho báo cáo.
+
+```powershell
+# 6a. Co-occurrence 14x14 + thống kê dịch tễ (1 pass trên 112k)
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  --driver-memory 2g --conf spark.executor.memory=2g `
+  /opt/spark/user-src/gold/disease_cooccurrence.py
+
+# 6b. Disease co-occurrence network (GraphX-style: degree, centrality, community)
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  --driver-memory 2g --conf spark.executor.memory=2g `
+  /opt/spark/user-src/gold/disease_graph.py
+
+# 6c. Verify toàn bộ output Gold
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/gold/verify_gold.py
+```
+
+**Kết quả co-occurrence (112,120 ảnh):**
+
+| Bệnh | Ca | Tỷ lệ |
+|---|---|---|
+| Infiltration | 19,894 | 17.7% |
+| Effusion | 13,317 | 11.9% |
+| Atelectasis | 11,559 | 10.3% |
+| Nodule | 6,331 | 5.6% |
+| Mass | 5,782 | 5.2% |
+| Pneumothorax | 5,302 | 4.7% |
+| … | | |
+| Hernia | 227 | 0.2% |
+
+- **Comorbidity**: 60,361 ảnh không bệnh (53.8%), 30,963 ảnh 1 bệnh, 14,306 ảnh
+  2 bệnh, 4,856 ảnh 3 bệnh; tối đa 9 bệnh/ảnh
+- **Top cặp đồng mắc**: Effusion+Infiltration (4,000), Atelectasis+Effusion (3,275),
+  Atelectasis+Infiltration (3,264)
+- **Lưu ý phương pháp**: co-occurrence thô KHÔNG đủ để kết luận liên kết bệnh —
+  trên 112k ảnh *mọi* cặp 14 bệnh đều xuất hiện cùng ít nhất 1 lần (91/91 cạnh →
+  degree centrality bằng nhau, community sụp thành 1 nhóm). Vì vậy Gold dùng thêm
+  **lift** = P(d1,d2)/(P(d1)·P(d2)) và chỉ giữ cạnh có `cooccurrence ≥ 50` và
+  `lift ≥ 2.0`.
+
+**Mạng bệnh lý (17 cạnh ý nghĩa, modularity Q = 0.472 — ngưỡng Newman ≥ 0.3):**
+
+| Cộng đồng | Bệnh | Diễn giải |
+|---|---|---|
+| 1 | Atelectasis, Cardiomegaly, Effusion, Consolidation | Nhóm tràn dịch/tim to/xẹp phổi |
+| 2 | Edema, Infiltration, Pneumonia | Nhóm phù phổi/nhiễm trùng |
+| 3 | Emphysema, Pneumothorax | Nhóm COPD/tràn khí màng phổi |
+| 4 | Fibrosis, Mass, Nodule, Pleural_Thickening | Nhóm tổn thương mạn/tổ chức kẽ |
+| 5 | Hernia | Bệnh hiếm, tách biệt |
+
+- **Liên kết mạnh nhất (lift)**: Edema+Pneumonia (11.6), Emphysema+Pneumothorax (6.3),
+  Fibrosis+Pleural_Thickening (3.5), Cardiomegaly+Effusion (3.2), Mass+Nodule (2.8)
+- **Trung tâm nhất (weighted degree)**: Effusion, Atelectasis, Consolidation
+- Ngưỡng lift được chọn tự động: quét `1.0 → 3.0`, lấy ngưỡng **thấp nhất** (đồ thị
+  dày nhất, giữ nhiều bệnh) mà modularity ≥ 0.3 → kết quả ghi ở
+  `gold/graph/threshold_sweep`
+
+**Lưu ý GraphX**: PySpark không expose API GraphX (chỉ có trong Scala). Đồ thị chỉ
+14 node / 91 cạnh nên degree/centrality tính bằng Spark DataFrame, community
+detection dùng **greedy modularity (Clauset-Newman-Moore)** chạy trên driver sau khi
+collect — tương đương GraphX cho use-case này và tất định (seed cố định).
+
+### 7. Gold layer — MLlib trên feature vectors DenseNet121
+
+```powershell
+# 7a. Trích 1024-d features từ checkpoint Stage-2 (preprocessing giống lúc train:
+#     grayscale → 224 → nhân lung mask → ImageNet normalize)
+python scripts/dev/extract_densenet_features.py
+
+# 7b. Upload Parquet lên Gold
+docker run --rm --network chexspark_chexspark-net `
+  -v "D:\BigData\CheXSpark\data\tmp:/data:ro" --entrypoint sh `
+  bitnamilegacy/minio-client:latest -c `
+  "mc alias set local http://minio:9000 $env:MINIO_ROOT_USER $env:MINIO_ROOT_PASSWORD; mc cp /data/densenet_features.parquet local/gold/features/densenet121/features.parquet"
+
+# 7c. PCA + K-Means + baseline LR/RF
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  --driver-memory 2g --conf spark.executor.memory=2g `
+  /opt/spark/user-src/gold/mllib_analysis.py
+```
+
+Output: `gold/mllib/pca_variance`, `pca_points` (scatter 2D + nhãn cụm),
+`kmeans_sweep` (silhouette theo k), `kmeans_clusters` (thành phần bệnh mỗi cụm),
+`baseline_metrics` (AUC LR vs RF từng bệnh) — MLflow experiment
+`chexspark-gold-mllib`.
+
 ## Ghi chú
 
 - Bucket `mlflow` được tạo tự động bởi service `minio-init`; các bucket dữ liệu (`bronze`, `silver`, `gold`, `checx`) tạo qua MinIO console hoặc `mc`.

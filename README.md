@@ -293,6 +293,26 @@ Output: `gold/mllib/pca_variance`, `pca_points` (scatter 2D + nhãn cụm),
 `baseline_metrics` (AUC LR vs RF từng bệnh) — MLflow experiment
 `chexspark-gold-mllib`.
 
+**Kết quả trên 2,000 ảnh dev (2000 × 1024-d):**
+
+| Phân tích | Kết quả |
+|---|---|
+| PCA | 2 PC đầu giải thích **18.7%** phương sai, 50 PC = **67.2%** |
+| K-Means | silhouette cao nhất chỉ **0.156** (k=2) → không có cụm tách bạch rõ trong không gian 1024-d |
+| Cụm 0 (858 ảnh) | giàu Edema ×2.2, Cardiomegaly ×2.1, Hernia ×2.1; 32.6% không bệnh |
+| Cụm 1 (1142 ảnh) | 72.9% không bệnh — nhóm "bình thường/nhẹ" |
+| **Baseline LR** | **mean AUC 0.631** (cao nhất: Cardiomegaly 0.872, Atelectasis 0.735, Fibrosis 0.697) |
+| **Baseline RF** | mean AUC 0.595 (cao nhất: Cardiomegaly 0.762, Atelectasis 0.744) |
+| DenseNet121 end-to-end | test mAU 0.627 (Stage-2, 2k ảnh / 8 epochs) |
+
+> **Nhận xét cho báo cáo**: Logistic Regression trên **feature đóng băng** của
+> DenseNet121 đạt mean AUC 0.631 — **tương đương** fine-tune end-to-end (0.627).
+> Với chỉ 2k ảnh, việc train lại toàn bộ 7M tham số không hiệu quả bằng dùng
+> feature trích sẵn; đây là luận cứ để mở rộng dữ liệu (5.6k → 112k) thay vì
+> tăng epoch. Silhouette thấp (0.156) cho thấy feature space chưa phân tách bệnh
+> lý rõ — nhất quán với mAU còn thấp; cần model/dữ liệu tốt hơn trước khi kỳ vọng
+> cụm bệnh lý tách bạch.
+
 ## Ghi chú
 
 - Bucket `mlflow` được tạo tự động bởi service `minio-init`; các bucket dữ liệu (`bronze`, `silver`, `gold`, `checx`) tạo qua MinIO console hoặc `mc`.

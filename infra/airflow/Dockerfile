@@ -21,10 +21,13 @@ RUN if ! command -v java >/dev/null 2>&1; then \
 
 USER airflow
 
-# PySpark 3.5.1 = đúng phiên bản cluster (chexspark-spark:3.5.1) để tránh lệch protocol
+# PySpark 3.5.1 = đúng phiên bản cluster (chexspark-spark:3.5.1) để tránh lệch protocol.
+# mlflow 2.9.2: driver Spark chạy TRONG container này (client deploy mode) nên cần
+# mlflow để log run — thiếu nó job vẫn "thành công" nhưng bỏ qua toàn bộ tracking.
 RUN pip install --no-cache-dir \
         "pyspark==3.5.1" \
-        "apache-airflow-providers-apache-spark==4.8.1"
+        "apache-airflow-providers-apache-spark==4.8.1" \
+        "mlflow==2.9.2"
 
 # spark-submit được pip đặt trong ~/.local/bin
 # LƯU Ý: KHÔNG set PYSPARK_PYTHON — biến này bị Spark lan sang executor

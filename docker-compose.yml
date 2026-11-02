@@ -210,7 +210,8 @@ services:
 
   # ─────────────────────────── MLflow Tracking Server ───────────────────────────
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.9.2
+    build: ./infra/mlflow          # + psycopg2 (Postgres) + boto3 (MinIO)
+    image: chexspark-mlflow:2.9.2
     container_name: chexspark-mlflow
     depends_on:
       postgres:
@@ -225,12 +226,18 @@ services:
       MLFLOW_ARTIFACT_ROOT: s3://mlflow
     ports:
       - "${MLFLOW_PORT:-5000}:5000"
-    command: >
-      mlflow server
-      --host 0.0.0.0 --port 5000
-      --backend-store-uri "$$MLFLOW_BACKEND_STORE_URI"
-      --default-artifact-root "$$MLFLOW_ARTIFACT_ROOT"
-      --serve-artifacts
+    # entrypoint sh -c: cần shell để expand $MLFLOW_* (Docker không expand biến
+    # trong CMD). Trước đây thiếu shell nên --default-artifact-root nhận đúng
+    # chuỗi "$MLFLOW_ARTIFACT_ROOT" → mọi artifact ghi vào /MLFLOW_ARTIFACT_ROOT
+    # trong container (mất khi recreate) thay vì MinIO.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        exec mlflow server --host 0.0.0.0 --port 5000
+        --backend-store-uri "$$MLFLOW_BACKEND_STORE_URI"
+        --artifacts-destination "$$MLFLOW_ARTIFACT_ROOT"
+        --default-artifact-root "mlflow-artifacts:/"
+        --serve-artifacts
     networks: [chexspark-net]
     restart: unless-stopped
 

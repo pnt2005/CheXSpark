@@ -132,7 +132,7 @@ def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None) -> No
     print(f"Tổng masks .npy: {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)")
 
     metadata = {
-        "title": "CheXSpark Masks 224 (packed, CheXmask ground truth)",
+        "title": "CheXSpark Masks 224 (packed)",
         "id": "chexspark-masks-224",
         "licenses": [{"name": "CC0-1.0"}],
     }

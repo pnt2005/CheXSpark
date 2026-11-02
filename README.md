@@ -485,7 +485,11 @@ tay trên web, `scripts/kaggle/train_on_kaggle.py` gói cả vòng đời thành
 ```powershell
 # 0. Cài + xác thực (một lần). GPU cần xác thực số điện thoại trong Kaggle Settings.
 D:\BigData\venv-mlops\Scripts\python -m pip install kaggle
-D:\BigData\venv-mlops\Scripts\kaggle auth login          # hoặc tạo ~/.kaggle/kaggle.json
+# Cách nhanh: đặt trong .env ở repo root (script tự nạp, không cần export tay):
+#   KAGGLE_USERNAME=pnt2005
+#   KAGGLE_KEY=KGAT_xxxxxxxx          (Kaggle → Settings → API → Generate New Token)
+# Script tự map KAGGLE_KEY -> KAGGLE_API_TOKEN cho kaggle CLI >= 2.0.
+# Hoặc cách OAuth: D:\BigData\venv-mlops\Scripts\kaggle auth login
 
 # 1. Kiểm tra credential + cấu hình
 D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1 --check
@@ -510,8 +514,8 @@ Script làm 6 việc:
 1. Cập nhật dataset `chexspark-stage2-nih-dev` (nếu `--upload-dataset`) — dùng chung cho cả 2 stage
 2. Cập nhật dataset `chexspark-masks-224` (nếu `--upload-masks`) — mask precompute, xem mục 5b
 3. Sinh `kernel-metadata.json` + **patch config trong notebook** (`IMG_ROOT`, `META_ROOT`,
-   `MASK_PACK_DIR`, `RESUME_FROM`, `EPOCHS`, `BASE`, `BATCH_SIZE`, `LR`, `MASK_MODE`)
-   vào `data/kaggle/kernels/stageN/`
+   `MASK_PACK_DIR`, `RESUME_FROM`, `EPOCHS`, `BASE`, `BATCH_SIZE`, `LR`, `NUM_WORKERS`,
+   `MASK_INPUT`, `MASK_MODE`, `AUG`, `TTA`, `CALIBRATE`) vào `data/kaggle/kernels/stageN/`
 4. `kaggle kernels push` → Kaggle chạy notebook trên GPU (`enable_gpu: true`)
 5. Poll `kaggle kernels status` tới khi xong; nếu lỗi **vẫn tải output** (checkpoint
    giữa chừng) và in lệnh `--resume-from` để chạy tiếp
@@ -539,8 +543,40 @@ sang nên không mất kết quả tốt nhất. Local cũng resume được:
 - `--check` dò username từ `KAGGLE_USERNAME` → `~/.kaggle/kaggle.json` → `kaggle config view`;
   không dò được thì truyền `--username`.
 - `--no-wait` để push rồi thoát; `--accelerator NvidiaTeslaT4` ép loại GPU.
-- `--mask-mode none` bỏ hẳn mask (nhanh nhất, baseline); `--mask-mode lungs` (mặc định)
-  dùng pack phổi; `lungs_heart` OR thêm pack tim.
+- `--mask-input none` bỏ hẳn mask (đối chứng); `masked` = cách cũ `ảnh*phổi`;
+  `3ch` (mặc định) = `[ảnh, ảnh*phổi, ảnh*(phổi∪tim)]`.
+- `--no-aug` / `--no-tta` / `--no-calibrate` để chạy ablation.
+
+### 6b. Cải tiến thuật toán Stage-2 (v1.1)
+
+Toàn bộ nằm trong `notebooks/kaggle/stage2_densenet121.ipynb`, **không đổi kiến trúc và
+không đổi `state_dict`** (DenseNet121 vẫn 3 kênh) → checkpoint cũ vẫn load được, nhưng
+phải train lại mới thấy hiệu quả.
+
+| Thay đổi | Config | Vì sao |
+|---|---|---|
+| **Mask 3 kênh ngữ nghĩa** `[ảnh, ảnh*phổi, ảnh*(phổi∪tim)]` | `MASK_INPUT='3ch'` | Cách cũ `ảnh*phổi` **xoá sạch bóng tim + trung thất** → Cardiomegaly (định nghĩa là tỉ lệ tim/ngực), Effusion, Mass sát trung thất mất bằng chứng |
+| **Augmentation đồng bộ ảnh + mask**: RRC scale ≥ 0.85, hflip, xoay ±7° | `AUG=True`, `AUG_SCALE`, `AUG_ROT` | Trước đây **không có augmentation nào**. Lấy tham số hình học **một lần** rồi áp cho cả ảnh và mask → không bị lệch mask |
+| **TTA hflip** | `TTA=True` | Trung bình logits ảnh gốc và ảnh lật; ~+0.2–0.4 mAUROC, gần như miễn phí |
+| **Temperature scaling + threshold từng nhãn** | `CALIBRATE=True` | Fit 1 tham số/nhãn trên **val** (grid search BCE), chọn ngưỡng tối đa Youden J, báo cáo sensitivity/specificity trên test — để xác suất dùng được cho bác sĩ |
+| **Gradient clipping 5.0** | — | Ổn định khi chạy AMP |
+
+Ablation (mỗi lần đổi **một** biến):
+
+```powershell
+# Đối chứng đúng nghĩa "trước đây": mask nhân cứng, không aug, không TTA
+... --stage 2 --mask-input masked --no-aug --no-tta --no-calibrate
+
+# Mask có giúp gì không?
+... --stage 2 --mask-input none --no-aug --no-tta
+
+# Chỉ thêm augmentation (giữ cách mask cũ) -> đo riêng tác dụng của aug
+... --stage 2 --mask-input masked --no-tta
+```
+
+Notebook ghi `calibration.temperature` và `calibration.threshold` (mỗi nhãn) vào
+`stage2_metrics.json`; serving (FastAPI/Streamlit) đọc lại để biến logit thành xác suất
+đã hiệu chỉnh thay vì dùng sigmoid thô.
 
 ## Orchestration với Apache Airflow
 

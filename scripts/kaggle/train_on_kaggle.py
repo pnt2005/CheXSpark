@@ -27,8 +27,13 @@ Usage:
     # Train Stage-1 trên GPU, tải kết quả về và đăng ký MLflow
     python scripts/kaggle/train_on_kaggle.py --stage 1 --upload-dataset --register
 
-    # Train Stage-2 (mask precompute, 30 epoch), rồi tự promote lên production
+    # Train Stage-2 với cấu hình cải tiến (mask 3 kênh + aug + TTA + calibration)
     python scripts/kaggle/train_on_kaggle.py --stage 2 --upload-masks --epochs 30 --register
+
+    # Ablation: tắt aug/TTA để so sánh, hoặc bỏ mask hoàn toàn (đối chứng)
+    python scripts/kaggle/train_on_kaggle.py --stage 2 --masks-dataset pnt2005/chexspark-masks-224 \
+        --no-aug --no-tta --mask-input masked
+    python scripts/kaggle/train_on_kaggle.py --stage 2 --mask-input none --no-aug
 
     # Kaggle cắt session 12h -> chạy tiếp từ checkpoint của lần trước
     python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 \\
@@ -52,6 +57,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def load_dotenv(path: Path) -> None:
+    """Nạp `.env` (KEY=VALUE) vào os.environ nếu chưa có — khỏi phải export tay."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and val:
+            os.environ.setdefault(key, val)
+
+
+load_dotenv(ROOT / ".env")
+# Kaggle CLI >= 2.0 xác thực bằng KAGGLE_API_TOKEN (token dạng KGAT_...);
+# .env cũ để KAGGLE_USERNAME/KAGGLE_KEY nên map sang tên mới.
+if not os.getenv("KAGGLE_API_TOKEN") and os.getenv("KAGGLE_KEY"):
+    os.environ["KAGGLE_API_TOKEN"] = os.environ["KAGGLE_KEY"]
 
 # Dataset ảnh 224×224 của Kaggle (dùng chung cho cả 2 stage)
 IMAGE_DATASET = "khanfashee/nih-chest-x-ray-14-224x224-resized"
@@ -77,7 +103,9 @@ STAGES = {
         "metrics": "stage2_metrics.json",
         "checkpoint": "best_stage2_densenet121.pth",
         "last_checkpoint": "last_stage2_densenet121.pth",
-        "patch": {"EPOCHS": "8", "BATCH_SIZE": "32", "LR": "1e-4", "MASK_MODE": "'lungs'"},
+        "patch": {"EPOCHS": "8", "BATCH_SIZE": "32", "LR": "1e-4", "NUM_WORKERS": "4",
+                  "MASK_INPUT": "'3ch'", "MASK_MODE": "'lungs_heart'",
+                  "AUG": "True", "TTA": "True", "CALIBRATE": "True"},
         "register": "register_stage2_model",
         "primary": "test_mauroc",
     },
@@ -190,12 +218,16 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
         values["RESUME_FROM"] = (
             f"'/kaggle/input/{resume_ref.split('/')[-1]}/{cfg['last_checkpoint']}'"
         )
-    for key in ("epochs", "base", "batch_size", "lr", "mask_mode", "img_size"):
-        if overrides.get(key):
+    for key in ("epochs", "base", "batch_size", "lr", "mask_mode", "img_size",
+                "mask_input", "num_workers"):
+        if overrides.get(key) is not None:
             value = str(overrides[key])
-            if key == "mask_mode" and not value.startswith(("'", '"')):
-                value = f"'{value}'"   # MASK_MODE là chuỗi
+            if key in ("mask_mode", "mask_input") and not value.startswith(("'", '"')):
+                value = f"'{value}'"   # MASK_MODE / MASK_INPUT là chuỗi
             values[key.upper()] = value
+    for key in ("aug", "tta", "calibrate"):
+        if overrides.get(key) is not None:
+            values[key.upper()] = str(bool(overrides[key]))
     changed = patch_notebook(cfg["notebook"], values, nb_out)
 
     dataset_sources = [img_ref, meta_ref] + ([masks_ref] if masks_ref else [])
@@ -239,10 +271,15 @@ def upload_dataset(kaggle: str, username: str, dataset_slug: str, dataset_dir: P
         raise SystemExit(f"Không thấy thư mục dataset: {dataset_dir}")
 
     meta_path = dataset_dir / "dataset-metadata.json"
-    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    meta = json.loads(meta_path.read_text(encoding="utf-8-sig")) if meta_path.exists() else {}
     meta["id"] = f"{username}/{dataset_slug.split('/')[-1]}"
     meta.setdefault("title", "CheXSpark NIH dev (labels + CheXmask RLE)")
     meta.setdefault("licenses", [{"name": "CC0-1.0"}])
+    # Kaggle yêu cầu title 6..50 ký tự — cắt bớt thay vì để `datasets create` fail.
+    title = str(meta.get("title", "")).strip()
+    if not (6 <= len(title) <= 50):
+        meta["title"] = (title[:50].strip() or f"CheXSpark {meta['id'].split('/')[-1]}")[:50]
+        print(f"[WARN] title {title!r} không hợp lệ (6..50 ký tự) -> dùng {meta['title']!r}")
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
     ref = meta["id"]
@@ -392,6 +429,16 @@ def main() -> None:
     ap.add_argument("--batch-size", default=None)
     ap.add_argument("--lr", default=None)
     ap.add_argument("--mask-mode", default=None, help="stage 2: 'lungs' | 'lungs_heart' | 'none'")
+    ap.add_argument("--mask-input", choices=("3ch", "masked", "none"), default=None,
+                    help="stage 2: cách đưa mask vào ảnh. '3ch' = [ảnh, ảnh*phổi, "
+                         "ảnh*(phổi|tim)] — giữ ngữ cảnh tim/trung thất (mặc định)")
+    ap.add_argument("--no-aug", dest="aug", action="store_false", default=None,
+                    help="tắt augmentation (RRC + hflip + rotate) để so sánh")
+    ap.add_argument("--no-tta", dest="tta", action="store_false", default=None,
+                    help="tắt TTA hflip lúc eval")
+    ap.add_argument("--no-calibrate", dest="calibrate", action="store_false", default=None,
+                    help="tắt temperature scaling + threshold theo nhãn")
+    ap.add_argument("--workers", default=None, help="NUM_WORKERS của DataLoader")
     ap.add_argument("--img-size", default=None)
     ap.add_argument("--no-gpu", dest="gpu", action="store_false", help="chạy CPU (debug)")
     ap.add_argument("--accelerator", default=None,
@@ -453,6 +500,8 @@ def main() -> None:
     overrides = {
         "epochs": args.epochs, "base": args.base, "batch_size": args.batch_size,
         "lr": args.lr, "mask_mode": args.mask_mode, "img_size": args.img_size,
+        "mask_input": args.mask_input, "num_workers": args.workers,
+        "aug": args.aug, "tta": args.tta, "calibrate": args.calibrate,
         "image_dataset": args.image_dataset, "kernel_slug": args.kernel_slug,
         "gpu": args.gpu, "resume_from": resume_ref, "masks_dataset": masks_ref,
     }

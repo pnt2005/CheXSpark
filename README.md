@@ -43,7 +43,7 @@ CheXSpark/
 ├── src/
 │   ├── common/spark_session.py   # SparkSession factory (dùng chung mọi job)
 │   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, mask join, verify)
-│   ├── silver/                   # (sẵn sàng) cleaning, stratified split
+│   ├── silver/                   # precompute_masks.py — decode RLE 1 lần → mask 224 (bits+PNG)
 │   ├── gold/                     # co-occurrence, disease network, MLlib PCA/K-Means/LR/RF
 │   ├── dl/                       # U-Net (Stage-1), DenseNet121 + Grad-CAM (Stage-2/3), preprocess
 │   ├── mlops/                    # MLflow Model Registry (register/promote/load theo alias)
@@ -52,8 +52,8 @@ CheXSpark/
 │   └── kaggle/                   # stage1_unet_segmentation.ipynb (U-Net) + stage2_densenet121.ipynb
 ├── tests/                        # Unit & integration tests
 └── scripts/
-    ├── dev/                      # extract_subset, export Silver→Kaggle, train/eval Stage-1, features, Grad-CAM, registry
-    └── kaggle/                   # train_on_kaggle.py — push dataset+notebook, chờ train, tải output
+    ├── dev/                      # extract_subset, export Silver→Kaggle, export mask pack, train/eval Stage-1, features, Grad-CAM, registry
+    └── kaggle/                   # train_on_kaggle.py — push dataset+notebook, chờ train, resume, tải output
 ```
 
 ## Cách chạy
@@ -208,6 +208,41 @@ python scripts/dev/export_silver_masked_to_kaggle.py
 Output `data/kaggle/stage2-nih-dev/` (upload lên Kaggle làm dataset) — gắn kèm
 `notebooks/kaggle/stage2_densenet121.ipynb` + dataset ảnh
 `khanfashee/nih-chest-x-ray-14-224x224-resized` để train Stage-2.
+
+### 5b. Precompute mask 224×224 (Spark) — bỏ decode RLE mỗi epoch
+
+`cxr14_masked` giữ mask dạng RLE 1024×1024; decode + resize tốn **~8–12 ms/ảnh**.
+Với 112k ảnh × 20 epoch ≈ **6–8 giờ CPU** chỉ để dựng lại đúng một mask không đổi
+→ job Spark này decode **một lần** rồi lưu 2 dạng:
+
+- `mask_lung_bits` / `mask_heart_bits` — **packbits** (6.272 byte/ảnh; giải nén ~0,1 ms)
+- `png_lung` / `png_lungs_heart` — PNG xám 224×224 (~1 KB) để xem bằng mắt / serving
+
+```powershell
+# 5b-1. Job Spark (2000 mask dev ~40s; chạy tự động trong DAG chexspark_chexmask_join)
+docker compose exec -T spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/silver/precompute_masks.py
+
+# 5b-2. Copy Parquet về local
+docker run --rm --network chexspark_chexspark-net `
+  -e "MC_HOST_local=http://$env:MINIO_ROOT_USER:$env:MINIO_ROOT_PASSWORD@minio:9000" `
+  -v "D:\BigData\CheXSpark\data\tmp:/out" --entrypoint /opt/bitnami/minio-client/bin/mc `
+  bitnamilegacy/minio-client:latest cp --recursive local/silver/cxr14_masks /out/silver_masks
+
+# 5b-3. Export dataset Kaggle (masks_{split}.npy + masks_heart_{split}.npy + index)
+python scripts/dev/export_masks_to_kaggle.py --silver-dir data/tmp/silver_masks
+```
+
+Kết quả dev 2k: **2000/2000 mask**, 0 mask rỗng, diện tích phổi trung bình
+**24,5%**, tim **8,9%**, PNG ~1 KB/ảnh; `masks_{split}.npy` 12 MB (112k ảnh ≈ 0,7 GB,
+vẫn dưới hạn 20 GB/file của Kaggle). Đã verify **bit-for-bit** với
+`dl.preprocess.lung_mask` (8/8 ảnh) — không lệch một pixel.
+
+Notebook Stage-2 tự dùng pack khi có `MASK_PACK_DIR` (dataset `chexspark-masks-224`):
+`np.load(..., mmap_mode='r')` + `np.unpackbits` → **~0,1 ms/ảnh**, không tốn RAM,
+không decode RLE; vẫn fallback RLE nếu thiếu dataset. `MASK_MODE='lungs_heart'`
+OR thêm `masks_heart_{split}.npy`.
 
 ### 6. Stage-1 — U-Net phân đoạn phổi (Lung Segmentation)
 
@@ -460,18 +495,36 @@ D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1
 
 # 3. Train + tải kết quả + đăng ký MLflow (Docker phải đang chạy)
 D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1 --upload-dataset --register
-D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 --mask-mode lungs_heart --register
+
+# 4. Stage-2 full: đẩy luôn dataset mask precompute (bỏ decode RLE) rồi train
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 `
+  --upload-masks --epochs 30 --mask-mode lungs_heart --register
+
+# 5. Kaggle cắt session 12h → chạy tiếp từ checkpoint của lần trước
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 `
+  --epochs 30 --resume-from pnt2005/chexspark-stage2-densenet121 --register
 ```
 
-Script làm 5 việc:
+Script làm 6 việc:
 
 1. Cập nhật dataset `chexspark-stage2-nih-dev` (nếu `--upload-dataset`) — dùng chung cho cả 2 stage
-2. Sinh `kernel-metadata.json` + **patch config trong notebook** (`IMG_ROOT`, `META_ROOT`,
-   `EPOCHS`, `BASE`, `BATCH_SIZE`, `LR`, `MASK_MODE`) vào `data/kaggle/kernels/stageN/`
-3. `kaggle kernels push` → Kaggle chạy notebook trên GPU (`enable_gpu: true`)
-4. Poll `kaggle kernels status` tới khi xong; nếu lỗi thì in 40 dòng log cuối
-5. `kaggle kernels output` → tải checkpoint + metrics, `--install` copy vào
-   `notebooks/kaggle/`, `--register` đăng ký version mới + alias `production`
+2. Cập nhật dataset `chexspark-masks-224` (nếu `--upload-masks`) — mask precompute, xem mục 5b
+3. Sinh `kernel-metadata.json` + **patch config trong notebook** (`IMG_ROOT`, `META_ROOT`,
+   `MASK_PACK_DIR`, `RESUME_FROM`, `EPOCHS`, `BASE`, `BATCH_SIZE`, `LR`, `MASK_MODE`)
+   vào `data/kaggle/kernels/stageN/`
+4. `kaggle kernels push` → Kaggle chạy notebook trên GPU (`enable_gpu: true`)
+5. Poll `kaggle kernels status` tới khi xong; nếu lỗi **vẫn tải output** (checkpoint
+   giữa chừng) và in lệnh `--resume-from` để chạy tiếp
+6. `kaggle kernels output` → tải checkpoint + metrics (`best_*`, `last_*`), `--install`
+   copy vào `notebooks/kaggle/`, `--register` đăng ký version mới + alias `production`
+
+**Resume trên Kaggle** — mỗi epoch notebook ghi `last_*.pth` (model + optimizer +
+scheduler + epoch + best + history) vào `/kaggle/working`. Lần chạy sau, `--resume-from`
+khai báo kernel đó trong `kernel_sources` → output mount ở `/kaggle/input/<slug>/`
+và notebook tự `load_state_dict` rồi chạy tiếp từ `epoch+1` (LR schedule giữ nguyên
+vì `EPOCHS` là **tổng** số epoch). Checkpoint `best_*` của lần trước cũng được copy
+sang nên không mất kết quả tốt nhất. Local cũng resume được:
+`python scripts/dev/train_stage1_unet.py --epochs 30 --resume`.
 
 **Bấm nút trên GitHub** (`.github/workflows/kaggle-train.yml`): thêm 2 secrets
 `KAGGLE_USERNAME` / `KAGGLE_KEY` rồi **Actions → Train on Kaggle (GPU) → Run workflow**
@@ -486,6 +539,8 @@ Script làm 5 việc:
 - `--check` dò username từ `KAGGLE_USERNAME` → `~/.kaggle/kaggle.json` → `kaggle config view`;
   không dò được thì truyền `--username`.
 - `--no-wait` để push rồi thoát; `--accelerator NvidiaTeslaT4` ép loại GPU.
+- `--mask-mode none` bỏ hẳn mask (nhanh nhất, baseline); `--mask-mode lungs` (mặc định)
+  dùng pack phổi; `lungs_heart` OR thêm pack tim.
 
 ## Orchestration với Apache Airflow
 
@@ -495,7 +550,7 @@ Airflow điều phối toàn bộ pipeline Medallion: mỗi bước là một DA
 | DAG | Task | Việc |
 |---|---|---|
 | `chexspark_bronze_to_silver` | `ingest_bronze_to_silver` | 112k metadata → Silver `cxr14` (patient-level split) |
-| `chexspark_chexmask_join` | `ingest_chexmask_to_silver` | CheXmask RLE → Silver `cxr14_masked` (broadcast join) |
+| `chexspark_chexmask_join` | `ingest_chexmask_to_silver` → `precompute_masks_224` | CheXmask RLE → Silver `cxr14_masked` (broadcast join) → mask 224 packed+PNG |
 | `chexspark_gold_analytics` | `disease_cooccurrence` → `disease_graph` → `verify_gold` | Gold: co-occurrence + mạng bệnh lý |
 | `chexspark_pipeline` | 3 × `TriggerDagRunOperator` | Chạy tuần tự 3 DAG trên và **chờ** từng cái xong |
 

@@ -21,8 +21,12 @@ on:
         description: "Số epoch (để trống = dùng mặc định của notebook)"
         type: string
         required: false
-      # Không có input upload_dataset: CSV + RLE mask (35.8MB) nằm ở data/ (gitignored),
-      # nên bước đẩy dataset phải chạy ở máy local (--upload-dataset) trước.
+      resume_from:
+        description: "Kernel chạy trước để resume (vd <user>/chexspark-stage2-densenet121), để trống = train từ đầu"
+        type: string
+        required: false
+      # Không có input upload_dataset/upload_masks: CSV (35.8MB) và mask pack nằm ở
+      # data/ (gitignored), nên bước đẩy dataset phải chạy ở máy local trước.
 
 jobs:
   train:
@@ -53,9 +57,11 @@ jobs:
       - name: Train trên Kaggle
         env:
           EPOCHS: ${{ inputs.epochs }}
+          RESUME_FROM: ${{ inputs.resume_from }}
         run: |
           ARGS="--stage ${{ inputs.stage }} --poll 60 --wait-timeout 13800 --install"
           if [ -n "$EPOCHS" ]; then ARGS="$ARGS --epochs $EPOCHS"; fi
+          if [ -n "$RESUME_FROM" ]; then ARGS="$ARGS --resume-from $RESUME_FROM"; fi
           python scripts/kaggle/train_on_kaggle.py $ARGS
 
       - name: Upload checkpoint + metrics

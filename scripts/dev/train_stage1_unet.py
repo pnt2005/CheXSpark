@@ -14,8 +14,12 @@ Usage:
     # Train đầy đủ trên GPU
     python scripts/dev/train_stage1_unet.py --epochs 30 --batch-size 16
 
+    # Chạy tiếp sau khi bị cắt (đọc last_stage1_unet.pth: model+optimizer+epoch)
+    python scripts/dev/train_stage1_unet.py --epochs 30 --resume
+
 Output:
     notebooks/kaggle/best_stage1_unet.pth    checkpoint tốt nhất theo val Dice
+    notebooks/kaggle/last_stage1_unet.pth    trạng thái đầy đủ của epoch cuối (để resume)
     notebooks/kaggle/stage1_metrics.json     lịch sử train + Dice/IoU val/test
 """
 
@@ -123,6 +127,12 @@ def main() -> None:
     ap.add_argument("--test-limit", type=int, default=0, help="giới hạn số ảnh test khi eval cuối")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--resume", action="store_true",
+                    help="chạy tiếp từ `last_stage1_unet.pth` trong --out-dir")
+    ap.add_argument("--resume-path", type=Path, default=None,
+                    help="đường dẫn checkpoint resume cụ thể (thay cho --resume)")
+    ap.add_argument("--no-amp", dest="amp", action="store_false",
+                    help="tắt mixed precision (mặc định bật khi có CUDA)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -161,21 +171,50 @@ def main() -> None:
     criterion = BCEDiceLoss().to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    amp_enabled = args.amp and args.device.startswith("cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.out_dir / "best_stage1_unet.pth"
+    last_path = args.out_dir / "last_stage1_unet.pth"
     best_dice = -1.0
     history: list[dict] = []
+    start_epoch = 1
+    resumed_from: str | None = None
 
-    for ep in range(1, args.epochs + 1):
+    # --resume: đọc 'last_stage1_unet.pth' (model + optimizer + epoch) để chạy tiếp
+    resume_path = args.resume_path
+    if args.resume and not resume_path:
+        resume_path = last_path
+    if resume_path:
+        resume_path = Path(resume_path)
+        if resume_path.exists():
+            ck = torch.load(resume_path, map_location=args.device)
+            model.load_state_dict(ck["model"])
+            optimizer.load_state_dict(ck["optimizer"])
+            scheduler.load_state_dict(ck["scheduler"])
+            if amp_enabled and ck.get("scaler"):
+                scaler.load_state_dict(ck["scaler"])
+            start_epoch = int(ck["epoch"]) + 1
+            best_dice = float(ck.get("best", -1.0))
+            history = list(ck.get("history", []))
+            resumed_from = str(resume_path)
+            print(f"Resume từ {resume_path}: epoch {start_epoch}/{args.epochs}, "
+                  f"best_dice={best_dice:.4f}")
+        else:
+            print(f"[WARN] Không thấy checkpoint {resume_path} → train từ đầu")
+
+    for ep in range(start_epoch, args.epochs + 1):
         model.train()
         t0, total, seen = time.time(), 0.0, 0
         for step, (x, y) in enumerate(tr_dl, 1):
             x, y = x.to(args.device), y.to(args.device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                loss = criterion(model(x), y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             total += loss.item() * len(x)
             seen += len(x)
             if step % 20 == 0:
@@ -194,8 +233,22 @@ def main() -> None:
             torch.save(model.state_dict(), best_path)
             print(f"  -> lưu checkpoint mới (val_dice={best_dice:.4f})")
 
+        # Lưu trạng thái đầy đủ mỗi epoch → --resume chạy tiếp được sau khi bị cắt
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict() if amp_enabled else {},
+            "epoch": ep,
+            "best": best_dice,
+            "history": history,
+        }, last_path)
+
     print(f"\nBest val Dice = {best_dice:.4f} -> {best_path}")
-    model.load_state_dict(torch.load(best_path, map_location=args.device))
+    if best_path.exists():
+        model.load_state_dict(torch.load(best_path, map_location=args.device))
+    else:
+        print("[WARN] Không có best checkpoint (resume từ nguồn ngoài) — eval bằng trọng số cuối")
     test = evaluate(model, te_dl, args.device)
     print("TEST:", json.dumps(test, indent=2))
 
@@ -203,6 +256,8 @@ def main() -> None:
         "best_val_dice": best_dice,
         "test": test,
         "history": history,
+        "last_epoch": history[-1]["epoch"] if history else 0,
+        "resumed_from": resumed_from,
         "config": {
             "arch": "unet",
             "base": args.base,
@@ -210,6 +265,7 @@ def main() -> None:
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
+            "amp": amp_enabled,
             "n_train": len(train_df),
             "n_val": len(val_df),
             "n_test": len(test_df),

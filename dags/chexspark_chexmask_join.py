@@ -4,7 +4,13 @@ Nhiệm vụ: đọc CheXmask RLE (2GB, 112k dòng) từ Bronze, **filter về 2
 ngay lúc đọc** (tránh OOM trên cluster 8GB), broadcast join với Silver, validate
 Dice/RLE rồi ghi `s3a://silver/cxr14_masked` (33 cột = 25 nhãn + 7 mask).
 
-Script: `src/ingestion/ingest_chexmask_to_silver.py`
+Sau đó **precompute mask 224×224** (`silver/cxr14_masks`): decode RLE một lần,
+resize NEAREST, lưu packed bits (6272 B) + PNG. Nhờ vậy Stage-1/Stage-2 không
+phải decode RLE mỗi epoch (~8–12 ms/ảnh → ~0,1 ms/ảnh), và Kaggle nhận dataset
+`chexspark-masks-224` chỉ với 6 file .npy thay vì 112k file PNG.
+
+Script: `src/ingestion/ingest_chexmask_to_silver.py`,
+        `src/silver/precompute_masks.py`
 Điều kiện: Silver `cxr14` đã tồn tại (chạy DAG `chexspark_bronze_to_silver` trước).
 """
 
@@ -26,7 +32,7 @@ default_args = {
 
 with DAG(
     dag_id="chexspark_chexmask_join",
-    description="Bronze CheXmask -> Silver cxr14_masked (mask join, Spark)",
+    description="Bronze CheXmask -> Silver cxr14_masked -> mask 224 precompute (Spark)",
     schedule=None,
     start_date=datetime(2026, 1, 1),
     catchup=False,
@@ -40,4 +46,10 @@ with DAG(
         script="ingestion/ingest_chexmask_to_silver.py",
     )
 
-    join_mask
+    precompute_masks = spark_job(
+        task_id="precompute_masks_224",
+        script="silver/precompute_masks.py",
+        execution_timeout=timedelta(minutes=60),
+    )
+
+    join_mask >> precompute_masks

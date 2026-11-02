@@ -4,11 +4,12 @@ Máy local không có GPU, nên train thật diễn ra trên Kaggle (T4 ×2). Sc
 toàn bộ vòng đó thành 1 lệnh, thay vì thao tác tay trên web:
 
     1. (tuỳ chọn) cập nhật dataset `chexspark-stage2-nih-dev` (CSV + RLE mask)
-    2. Sinh `kernel-metadata.json` + notebook đã patch config (epochs/base/lr…)
-    3. `kaggle kernels push` → Kaggle chạy notebook trên GPU
-    4. Poll `kaggle kernels status` tới khi complete/error (in log nếu lỗi)
-    5. `kaggle kernels output` → tải checkpoint + metrics json
-    6. (tuỳ chọn) copy vào `notebooks/kaggle/` và đăng ký MLflow Registry
+    2. (tuỳ chọn) cập nhật dataset `chexspark-masks-224` (mask precompute, bỏ decode RLE)
+    3. Sinh `kernel-metadata.json` + notebook đã patch config (epochs/base/lr…)
+    4. `kaggle kernels push` → Kaggle chạy notebook trên GPU
+    5. Poll `kaggle kernels status` tới khi complete/error (in log nếu lỗi)
+    6. `kaggle kernels output` → tải checkpoint + metrics json (cả khi lỗi/timeout)
+    7. (tuỳ chọn) copy vào `notebooks/kaggle/` và đăng ký MLflow Registry
 
 Dùng **Kaggle CLI** (subprocess) chứ không dùng SDK Python: CLI giữ nguyên
 subcommand qua các phiên bản (SDK 2.x đã bỏ `dataset_create_new`), và tự xử lý
@@ -26,8 +27,12 @@ Usage:
     # Train Stage-1 trên GPU, tải kết quả về và đăng ký MLflow
     python scripts/kaggle/train_on_kaggle.py --stage 1 --upload-dataset --register
 
-    # Train Stage-2 với 30 epoch, rồi tự promote lên production
-    python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 --register
+    # Train Stage-2 (mask precompute, 30 epoch), rồi tự promote lên production
+    python scripts/kaggle/train_on_kaggle.py --stage 2 --upload-masks --epochs 30 --register
+
+    # Kaggle cắt session 12h -> chạy tiếp từ checkpoint của lần trước
+    python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 \\
+        --resume-from pnt2005/chexspark-stage2-densenet121
 
     # Chỉ build + in lệnh, không gọi Kaggle
     python scripts/kaggle/train_on_kaggle.py --stage 1 --dry-run
@@ -51,6 +56,7 @@ sys.path.insert(0, str(ROOT / "src"))
 # Dataset ảnh 224×224 của Kaggle (dùng chung cho cả 2 stage)
 IMAGE_DATASET = "khanfashee/nih-chest-x-ray-14-224x224-resized"
 DEFAULT_DATASET_SLUG = "chexspark-stage2-nih-dev"
+DEFAULT_MASKS_SLUG = "chexspark-masks-224"
 
 STAGES = {
     1: {
@@ -59,6 +65,7 @@ STAGES = {
         "title": "CheXSpark Stage1 U-Net lung segmentation",
         "metrics": "stage1_metrics.json",
         "checkpoint": "best_stage1_unet.pth",
+        "last_checkpoint": "last_stage1_unet.pth",
         "patch": {"BASE": "32", "EPOCHS": "30", "BATCH_SIZE": "16", "LR": "1e-3"},
         "register": "register_stage1_model",
         "primary": "test_dice_mean",
@@ -69,6 +76,7 @@ STAGES = {
         "title": "CheXSpark Stage2 DenseNet121 multi-label",
         "metrics": "stage2_metrics.json",
         "checkpoint": "best_stage2_densenet121.pth",
+        "last_checkpoint": "last_stage2_densenet121.pth",
         "patch": {"EPOCHS": "8", "BATCH_SIZE": "32", "LR": "1e-4", "MASK_MODE": "'lungs'"},
         "register": "register_stage2_model",
         "primary": "test_mauroc",
@@ -166,6 +174,8 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
     slug = cfg["kernel_slug"] if not overrides.get("kernel_slug") else overrides["kernel_slug"]
     img_ref = overrides.get("image_dataset") or IMAGE_DATASET
     meta_ref = f"{username}/{dataset_slug.split('/')[-1]}"
+    masks_ref = overrides.get("masks_dataset")
+    resume_ref = overrides.get("resume_from")
 
     kernel_id = f"{username}/{slug}"
     build_dir = ROOT / "data/kaggle/kernels" / f"stage{stage}"
@@ -174,6 +184,12 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
     values = dict(cfg["patch"])
     values["IMG_ROOT"] = f"'/kaggle/input/{img_ref.split('/')[-1]}'"
     values["META_ROOT"] = f"'/kaggle/input/{meta_ref.split('/')[-1]}'"
+    if masks_ref:
+        values["MASK_PACK_DIR"] = f"'/kaggle/input/{masks_ref.split('/')[-1]}'"
+    if resume_ref:
+        values["RESUME_FROM"] = (
+            f"'/kaggle/input/{resume_ref.split('/')[-1]}/{cfg['last_checkpoint']}'"
+        )
     for key in ("epochs", "base", "batch_size", "lr", "mask_mode", "img_size"):
         if overrides.get(key):
             value = str(overrides[key])
@@ -182,6 +198,7 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
             values[key.upper()] = value
     changed = patch_notebook(cfg["notebook"], values, nb_out)
 
+    dataset_sources = [img_ref, meta_ref] + ([masks_ref] if masks_ref else [])
     metadata = {
         "id": kernel_id,
         "title": cfg["title"],
@@ -192,9 +209,10 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
         "enable_gpu": bool(overrides.get("gpu", True)),
         "enable_tpu": False,
         "enable_internet": True,
-        "dataset_sources": [img_ref, meta_ref],
+        "dataset_sources": dataset_sources,
         "competition_sources": [],
-        "kernel_sources": [],
+        # kernel_sources: mount output của lần chạy trước vào /kaggle/input/<slug>
+        "kernel_sources": [resume_ref] if resume_ref else [],
         "model_sources": [],
     }
     (build_dir / "kernel-metadata.json").write_text(
@@ -203,7 +221,8 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
     print(f"\nKernel folder: {build_dir}")
     print(f"  id           : {kernel_id}")
     print(f"  notebook     : {nb_out.name}")
-    print(f"  datasets     : {', '.join(metadata['dataset_sources'])}")
+    print(f"  datasets     : {', '.join(dataset_sources)}")
+    print(f"  kernel source: {resume_ref or '(không — train từ đầu)'}")
     print(f"  GPU          : {metadata['enable_gpu']}")
     if changed:
         print(f"  config patch : {', '.join(changed)}")
@@ -304,12 +323,13 @@ def install_and_register(stage: int, cfg: dict, out_dir: Path, *,
     """Copy checkpoint/metrics vào `notebooks/kaggle/` rồi đăng ký MLflow Registry."""
     metrics_files = list(out_dir.rglob(cfg["metrics"]))
     ckpt_files = list(out_dir.rglob(cfg["checkpoint"]))
+    last_files = list(out_dir.rglob(cfg["last_checkpoint"]))
     if not metrics_files and not ckpt_files:
         print("\n[WARN] Không thấy checkpoint/metrics trong output — bỏ qua bước cài đặt.")
         return
 
     if install:
-        for f in ckpt_files + metrics_files:
+        for f in ckpt_files + last_files + metrics_files:
             dest = ROOT / "notebooks/kaggle" / f.name
             shutil.copy2(f, dest)
             print(f"  đã copy {f.name} -> notebooks/kaggle/")
@@ -354,6 +374,16 @@ def main() -> None:
     ap.add_argument("--upload-dataset", action="store_true",
                     help="tạo/ cập nhật version dataset trước khi train")
     ap.add_argument("--dataset-notes", default="CheXSpark: cap nhat CSV + RLE mask")
+    ap.add_argument("--masks-dataset", default=None,
+                    help="dataset mask precompute (mặc định chexspark-masks-224) — "
+                         "bỏ decode RLE mỗi epoch")
+    ap.add_argument("--masks-dir", type=Path,
+                    default=ROOT / "data/kaggle/stage2-masks-224")
+    ap.add_argument("--upload-masks", action="store_true",
+                    help="tạo/ cập nhật version dataset mask precompute trước khi train")
+    ap.add_argument("--resume-from", default=None,
+                    help="kernel chạy trước (vd pnt2005/chexspark-stage2-densenet121) — "
+                         "mount output làm kernel_sources và resume từ last_*.pth")
     ap.add_argument("--image-dataset", default=IMAGE_DATASET,
                     help="dataset ảnh 224×224 (mặc định mirror NIH của khanfashee)")
     ap.add_argument("--kernel-slug", default=None, help="đổi slug kernel (mặc định theo stage)")
@@ -394,6 +424,8 @@ def main() -> None:
         print(f"\nXác thực OK | username: {username or '(không dò được — truyền --username)'}")
         print(f"Dataset ảnh : {args.image_dataset}")
         print(f"Dataset meta: {args.dataset_slug} (local: {args.dataset_dir})")
+        print(f"Dataset mask: {args.masks_dataset or DEFAULT_MASKS_SLUG} "
+              f"(local: {args.masks_dir})")
         print(f"Notebook    : {cfg['notebook'].relative_to(ROOT)}")
         return
 
@@ -401,11 +433,28 @@ def main() -> None:
     if not username:
         raise SystemExit("Không dò được username Kaggle — truyền --username <tên>.")
 
+    # --resume-from: nhận 'user/kernel' hoặc chỉ 'kernel'
+    resume_ref = None
+    if args.resume_from:
+        resume_ref = args.resume_from.strip("/")
+        if "/" not in resume_ref:
+            resume_ref = f"{username}/{resume_ref}"
+
+    # Mask precompute chỉ có ý nghĩa với Stage-2 (Stage-1 decode RLE làm GT).
+    # Chỉ bật khi người dùng chủ động chọn (dataset phải tồn tại trên Kaggle rồi),
+    # tránh push fail vì thiếu dataset ở lần chạy đầu.
+    masks_ref = None
+    if args.stage == 2 and (args.masks_dataset or args.upload_masks):
+        masks_ref = args.masks_dataset or f"{username}/{DEFAULT_MASKS_SLUG}"
+    if args.stage == 2 and not masks_ref and args.mask_mode != "none":
+        print("[WARN] Không dùng mask precompute -> notebook decode RLE mỗi epoch "
+              "(~8-12 ms/ảnh). Thêm --upload-masks (lần đầu) hoặc --masks-dataset.")
+
     overrides = {
         "epochs": args.epochs, "base": args.base, "batch_size": args.batch_size,
         "lr": args.lr, "mask_mode": args.mask_mode, "img_size": args.img_size,
         "image_dataset": args.image_dataset, "kernel_slug": args.kernel_slug,
-        "gpu": args.gpu,
+        "gpu": args.gpu, "resume_from": resume_ref, "masks_dataset": masks_ref,
     }
     build_dir = build_kernel_dir(args.stage, cfg, username, args.dataset_slug, overrides)
     kernel_id = f"{username}/{(args.kernel_slug or cfg['kernel_slug'])}"
@@ -414,6 +463,8 @@ def main() -> None:
         print("\n[dry-run] Lệnh sẽ chạy:")
         if args.upload_dataset:
             print(f"  {kaggle} datasets create|version -p {args.dataset_dir} --dir-mode skip")
+        if args.upload_masks:
+            print(f"  {kaggle} datasets create|version -p {args.masks_dir} --dir-mode skip")
         print(f"  {kaggle} kernels push -p {build_dir} --timeout {args.run_timeout}")
         print(f"  {kaggle} kernels output {kernel_id} -p <output-dir>")
         return
@@ -421,16 +472,28 @@ def main() -> None:
     if args.upload_dataset:
         upload_dataset(kaggle, username, args.dataset_slug, args.dataset_dir,
                        args.dataset_notes)
+    if args.upload_masks:
+        upload_dataset(kaggle, username, DEFAULT_MASKS_SLUG, args.masks_dir,
+                       "CheXSpark: mask precompute 224 (packed .npy + heart)")
 
     status = push_and_wait(kaggle, kernel_id, build_dir,
                           accelerator=args.accelerator, run_timeout=args.run_timeout,
                           poll=args.poll, wait_timeout=args.wait_timeout,
                           no_wait=args.no_wait)
-    if status != "complete":
-        raise SystemExit(f"Kernel kết thúc với trạng thái '{status}' — xem log: "
-                         f"{kaggle} kernels logs {kernel_id}")
 
     out_dir = args.output_dir or (ROOT / "data/kaggle/output" / f"stage{args.stage}")
+    if status != "complete":
+        # Kaggle vẫn lưu output của lần chạy lỗi/timeout -> tải về để resume
+        print(f"\nKernel kết thúc với trạng thái '{status}'. Thử tải output giữa chừng ...")
+        try:
+            fetch_output(kaggle, kernel_id, out_dir)
+        except SystemExit:
+            pass
+        print(f"\nChạy tiếp (giữ nguyên --epochs):\n"
+              f"  python scripts/kaggle/train_on_kaggle.py --stage {args.stage} "
+              f"--resume-from {kernel_id} --epochs {args.epochs or cfg['patch']['EPOCHS']} ...")
+        raise SystemExit(f"Xem log: {kaggle} kernels logs {kernel_id}")
+
     fetch_output(kaggle, kernel_id, out_dir)
     install_and_register(args.stage, cfg, out_dir,
                          install=args.install or args.register,

@@ -25,12 +25,21 @@ Sản phẩm (1 dòng / ảnh, partition theo `split`):
 Packed bits nhỏ (6,1 KB/ảnh → ~0,7 GB cho 112k) và giải nén bằng
 `np.unpackbits` (~0,1 ms) — nhanh hơn decode RLE ~100×.
 
+Hai nguồn input (`--source`):
+    silver (mặc định) — `silver/cxr14_masked` (dev 2k, đã có cột RLE trong Parquet)
+    bronze            — đọc thẳng CheXmask CSV 112k/2GB từ MinIO Bronze, broadcast
+                        join `split` từ `silver/cxr14_full` → KHÔNG materialize
+                        RLE 112k vào Silver (2GB Parquet thừa), KHÔNG shuffle RLE.
+
 Usage (trong container):
     spark-submit --master spark://spark-master:7077 \\
         /opt/spark/user-src/silver/precompute_masks.py
 
     # dev subset, giới hạn 200 dòng
     ... precompute_masks.py --limit 200
+
+    # full 112k: mask RLE từ Bronze + split từ silver/cxr14_full
+    ... precompute_masks.py --source bronze --out s3a://silver/cxr14_masks_full
 """
 
 from __future__ import annotations
@@ -58,6 +67,11 @@ from common.spark_session import get_spark_session  # noqa: E402
 
 SRC = os.getenv("CHEXSPARK_SILVER_MASKED", "s3a://silver/cxr14_masked")
 OUT = os.getenv("CHEXSPARK_SILVER_MASKS", "s3a://silver/cxr14_masks")
+# --source bronze: CheXmask RLE 112k/2GB nằm trong Bronze; split (patient-level)
+# lấy từ Silver full do `ingest_bronze_to_silver.py --full` ghi ra.
+BRONZE_CHEXMASK = os.getenv("CHEXSPARK_BRONZE_CHEXMASK",
+                            "s3a://bronze/chexmask/ChestX-Ray8.csv")
+SILVER_FULL = os.getenv("CHEXSPARK_SILVER_FULL", "s3a://silver/cxr14_full")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 MLFLOW_EXPERIMENT = os.getenv("MLFLOW_EXPERIMENT", "chexspark-silver-masks")
 
@@ -164,16 +178,62 @@ def build_udf(img_size: int):
     return _precompute
 
 
+def load_input(spark, args, cols: list[str]):
+    """Đọc input theo `--source`.
+
+    silver — Parquet `cxr14_masked` (dev, cột RLE đã materialize).
+    bronze — CheXmask CSV 112k/2GB từ MinIO Bronze + broadcast join `split`
+             từ `silver/cxr14_full`:
+      * broadcast split (112k rows, vài MB) -> map-side join, RLE **không**
+        đi qua shuffle (2GB string shuffle sẽ OOM cluster 8GB);
+      * KHÔNG repartition sau join — số partition do `maxPartitionBytes` của
+        CSV read quyết định (đọc lại là mất 2GB shuffle cho việc bàn giao).
+    """
+    if args.source == "bronze":
+        from ingestion.ingest_chexmask_to_silver import CHEXMASK_SCHEMA
+
+        masks = (
+            spark.read
+            .option("header", True)
+            .option("mode", "PERMISSIVE")
+            .schema(CHEXMASK_SCHEMA)
+            .csv(args.chexmask)
+            .drop("landmarks")
+        )
+        splits = spark.read.parquet(args.split_src).select("image_index", "split")
+        n_split = splits.count()
+        print(f"[bronze] masks = {args.chexmask} | split = {args.split_src} "
+              f"({n_split} rows)")
+        df = masks.join(F.broadcast(splits), on="image_index", how="inner")
+        if args.limit:
+            df = df.limit(args.limit)
+        return df
+
+    df = spark.read.parquet(args.src).select(*cols)
+    if args.limit:
+        df = df.limit(args.limit)
+    n_parts = args.partitions or int(os.getenv("SPARK_CORES_MAX", "4")) * 2
+    return df.repartition(n_parts)
+
+
 def main() -> None:
     import argparse
+    import time
 
     ap = argparse.ArgumentParser(description="Precompute mask 224x224 (packed + PNG)")
+    ap.add_argument("--source", choices=("silver", "bronze"), default="silver",
+                    help="silver = Parquet cxr14_masked (dev); bronze = đọc CheXmask "
+                         "112k từ MinIO Bronze + split từ silver/cxr14_full")
     ap.add_argument("--src", default=SRC)
+    ap.add_argument("--chexmask", default=BRONZE_CHEXMASK,
+                    help="CSV CheXmask trong Bronze (chỉ dùng --source bronze)")
+    ap.add_argument("--split-src", default=SILVER_FULL,
+                    help="Parquet chứa cột split (chỉ dùng --source bronze)")
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--img-size", type=int, default=IMG_SIZE)
     ap.add_argument("--limit", type=int, default=0, help="chỉ xử lý N dòng đầu (dev)")
     ap.add_argument("--partitions", type=int, default=0,
-                    help="số partition (0 = theo số core cluster)")
+                    help="số partition (0 = theo số core cluster; bronze bỏ qua)")
     args = ap.parse_args()
 
     spark = get_spark_session("chexspark-silver-precompute-masks")
@@ -181,23 +241,22 @@ def main() -> None:
 
     cols = ["image_index", "split", "mask_height", "mask_width", "dice_rca_mean",
             "mask_left_rle", "mask_right_rle", "mask_heart_rle"]
-    df = spark.read.parquet(args.src).select(*cols)
-    if args.limit:
-        df = df.limit(args.limit)
-
-    n_parts = args.partitions or int(os.getenv("SPARK_CORES_MAX", "4")) * 2
-    df = df.repartition(n_parts)
+    df = load_input(spark, args, cols)
 
     out = df.mapInPandas(build_udf(args.img_size), schema=OUT_SCHEMA)
 
-    # Ghi theo split (train/val/test) để đọc đúng phần cần
+    # Ghi theo split (train/val/test) để đọc đúng phần cần.
+    # Đo riêng thời gian write (= decode RLE 112k) làm workload đo scaling.
+    t0 = time.time()
     (out.write.mode("overwrite")
      .partitionBy("split")
      .parquet(args.out))
+    write_sec = time.time() - t0
 
     # ------------------------------------------------------------------ #
     # Validate: số dòng, mask rỗng (decode lỗi), tỉ lệ phổi
     # ------------------------------------------------------------------ #
+    expected = df.count()   # đếm input: 1 lần scan, KHÔNG decode RLE
     result = spark.read.parquet(args.out)
     total_px = args.img_size * args.img_size
     stats = result.agg(
@@ -212,10 +271,16 @@ def main() -> None:
         F.sum((F.col("split") == "test").cast("int")).alias("test_rows"),
     ).collect()[0].asDict()
 
-    expected = df.count()
+    # Số đo phục vụ benchmark scaling (2k -> 112k, 1 worker -> 2 worker)
+    stats["write_sec"] = round(write_sec, 1)
+    stats["rows_per_sec"] = round(expected / max(write_sec, 1e-6), 1)
+    stats["output_partitions"] = result.rdd.getNumPartitions()
+
     print("=== PRECOMPUTE MASKS STATS ===")
     for k, v in stats.items():
         print(f"  {k}: {v}")
+    print(f"  source: {args.source} | write: {write_sec:.1f}s "
+          f"({stats['rows_per_sec']} mask/s)")
 
     if stats["masked_rows"] != expected:
         raise RuntimeError(
@@ -239,10 +304,12 @@ def log_to_mlflow(stats: dict, args) -> None:
 
         with mlflow.start_run(run_name=f"precompute-masks-{datetime.utcnow():%Y%m%d-%H%M%S}"):
             mlflow.log_params({
-                "source": args.src,
+                "source": args.source,
+                "input": args.chexmask if args.source == "bronze" else args.src,
                 "output": args.out,
                 "img_size": args.img_size,
                 "encoding": "packbits_6272B + png_gray",
+                "cores_max": os.getenv("SPARK_CORES_MAX", "default"),
             })
             mlflow.log_metrics({
                 k: float(v) for k, v in stats.items() if v is not None

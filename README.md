@@ -244,6 +244,76 @@ Notebook Stage-2 tự dùng pack khi có `MASK_PACK_DIR` (dataset `chexspark-mas
 không decode RLE; vẫn fallback RLE nếu thiếu dataset. `MASK_MODE='lungs_heart'`
 OR thêm `masks_heart_{split}.npy`.
 
+### 5c. Scale toàn bộ 112k ảnh (Silver full + mask pack 1,34 GB)
+
+Dev 2k chỉ để chạy đúng luồng — số liệu chốt phải train trên **112.120 ảnh /
+30.805 bệnh nhân**. Các bước chuẩn bị dưới đây chạy hoàn toàn bằng Spark, không tốn GPU:
+
+```powershell
+# 5c-1. Silver full: bỏ join manifest 2k -> 112.120 rows. Split vẫn hash(patient_id)
+#        cố định nên dev 2k và full 112k gán cùng một split cho cùng bệnh nhân.
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  /opt/spark/user-src/ingestion/ingest_bronze_to_silver.py --full
+#    -> s3a://silver/cxr14_full: train 77.728 / val 17.662 / test 16.730 (~30s)
+
+# 5c-2. Precompute mask 112k: đọc thẳng CheXmask RLE (2 GB) từ Bronze rồi
+#        broadcast join split -> không shuffle 2 GB, không repartition (cluster 8 GB)
+docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
+  --master spark://spark-master:7077 --deploy-mode client `
+  --conf spark.executor.memory=1g --conf spark.executor.cores=1 `
+  --conf spark.cores.max=4 --conf spark.sql.files.maxPartitionBytes=33554432 `
+  /opt/spark/user-src/silver/precompute_masks.py --source bronze `
+  --out s3a://silver/cxr14_masks_full
+#    -> 112.120/112.120 mask, 0 mask rỗng, phổi 24,4% | tim 8,9% | 36 partitions
+
+# 5c-3. Copy 2 Parquet về local rồi export pack npy + labels CSV (không kèm RLE)
+docker run --rm --network chexspark_chexspark-net `
+  -e "MC_HOST_local=http://$env:MINIO_ROOT_USER:$env:MINIO_ROOT_PASSWORD@minio:9000" `
+  -v "D:\BigData\CheXSpark\data\tmp:/out" --entrypoint /opt/bitnami/minio-client/bin/mc `
+  bitnamilegacy/minio-client:latest cp --recursive local/silver/cxr14_full /out/silver_full/
+#   (tương tự cho cxr14_masks_full -> data/tmp/silver_masks_full/)
+
+python scripts/dev/export_masks_to_kaggle.py `
+  --silver-dir data/tmp/silver_masks_full/cxr14_masks_full `
+  --out-dir data/kaggle/stage2-masks-224-112k `
+  --dataset-id pnt2005/chexspark-masks-224-112k `
+  --title "CheXSpark Masks 224 112k (packed)"
+
+python scripts/dev/export_silver_labels.py `
+  --silver-dir data/tmp/silver_full/cxr14_full `
+  --out data/kaggle/stage2-nih-112k/stage2_train.csv `
+  --drop image_uri silver_ingested_at
+```
+
+Kết quả 112k:
+
+| Artefact | Nội dung | Dung lượng |
+|---|---|---|
+| `stage2-masks-224-112k/` | 6 file `masks{,_heart}_{train,val,test}.npy` (packbits 6.272 B/ảnh) + `mask_index.csv` 112.120 dòng | **1.341 MB** |
+| `stage2-nih-112k/stage2_train.csv` | 14 nhãn + split, **không RLE** (mask pack đã cover 112.120/112.120) | **8,9 MB** |
+
+Đã verify: `mask_index.csv` ↔ `stage2_train.csv` join tuyệt đối (0 dòng lệch, 0 split
+sai), `mask_row` phủ đúng `0..n-1` mỗi split khớp shape npy, và fg decode từ pack
+khớp `n_fg_lung`/`n_fg_heart` trong index.
+
+**Đo scaling** (cùng job, cùng config, `write_sec` của 112k):
+
+| Phép đo | Cấu hình | Thời gian ghi | Throughput |
+|---|---|---|---|
+| Data scaling | 2.000 ảnh (dev smoke) | 37,5 s | 53 mask/s |
+| | **112.120 ảnh** (56× dữ liệu) | **207,5 s** (5,5× thời gian) | **540 mask/s** (10×) |
+| Worker scaling | 1 worker × 2 core | 245,4 s | 457 mask/s |
+| | 2 worker × 4 core | **207,5 s** | 540 mask/s → **speedup 1,18×** |
+
+Hai phép đo cho thấy: (1) overhead cố định (Spark job setup, broadcast, log MLflow)
+chiếm phần lớn ở quy mô nhỏ nên throughput tăng ~10× khi scale dữ liệu 56×;
+(2) scale-out **phụ tuyến tính** (2× core chỉ được 1,18×) vì bottleneck là I/O single-node
+— CheXmask 2 GB và MinIO đều nằm trên cùng VM 8 GB, cộng thêm stage ghi Parquet
+36 partition chạy trên một nút. Muốn speedup tuyến tính thì phải tách MinIO ra nút riêng
+hoặc chạy cluster đa node; đây cũng chính là lý do job dùng `maxPartitionBytes=32 MB`
+để tách file lớn thành ~66 partition thay vì đọc tuần tự.
+
 ### 6. Stage-1 — U-Net phân đoạn phổi (Lung Segmentation)
 
 Giai đoạn 1 của pipeline học sâu: sinh mask phổi từ **ảnh X-quang thô**, thay cho
@@ -507,7 +577,22 @@ D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2
 # 5. Kaggle cắt session 12h → chạy tiếp từ checkpoint của lần trước
 D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 `
   --epochs 30 --resume-from pnt2005/chexspark-stage2-densenet121 --register
+
+# 6. Train FULL 112k (model promote production): upload 2 dataset + train 30 epoch.
+#    Chuẩn bị dữ liệu đã xong ở mục 5c — ở đây chỉ đẩy lên Kaggle rồi train.
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 `
+  --dataset-slug chexspark-stage2-nih-112k --dataset-dir data\kaggle\stage2-nih-112k `
+  --upload-dataset `
+  --masks-dataset pnt2005/chexspark-masks-224-112k --masks-dir data\kaggle\stage2-masks-224-112k `
+  --upload-masks `
+  --epochs 30 --register --install `
+  --run-timeout 43200 --wait-timeout 46800 `
+  --output-dir data\kaggle\output\stage2-112k
 ```
+
+Lệnh 6 dùng `--dataset-slug` / `--masks-dataset` để **tách dataset 112k khỏi bản dev 2k**
+(`chexspark-stage2-nih-dev` / `chexspark-masks-224`) — run dev và run 112k không đụng
+vào nhau, và chỉ run 112k mới `--register` lên alias `production`.
 
 Script làm 6 việc:
 
@@ -573,6 +658,22 @@ Ablation (mỗi lần đổi **một** biến):
 # Chỉ thêm augmentation (giữ cách mask cũ) -> đo riêng tác dụng của aug
 ... --stage 2 --mask-input masked --no-tta
 ```
+
+**Kết quả ablation Stage-2 trên dev** (8 epoch, cùng seed/data, mUAROC 14 bệnh
+trên test 344 ảnh — chỉ mang giá trị **định hướng** vì tập test quá nhỏ):
+
+| Cấu hình | val mAUROC | test mAUROC | Δ vs v1.1 |
+|---|---|---|---|
+| **v1.1 đầy đủ**: `3ch` + aug + TTA + calibration | 0.7052 | **0.6873** | — |
+| Đối chứng cũ: `masked` + không aug + không TTA | 0.7097 | 0.6685 | −0.0188 |
+| Bỏ hẳn mask: `none` + không aug + không TTA | 0.7043 | 0.6375 | −0.0498 |
+
+- **Mask có giúp thật**: cùng tắt aug/TTA, `masked` hơn `none` **+0.0310
+  mAUROC** (0.6685 vs 0.6375) — mask phổi/tim mang bằng chứng, không phải trang trí.
+- **Gói v1.1 (3ch + aug + TTA) hơn cách cũ +0.0188** (0.6873 vs 0.6685).
+- Val của ba run gần như giống nhau (0.704–0.710) trong khi test dao động
+  0.638–0.687 → đúng dự đoán: với 321 val / 344 test, con số chỉ để so sánh
+  **xu hướng**, không phải hiệu năng tuyệt đối — số liệu chốt phải là run 112k.
 
 Notebook ghi `calibration.temperature` và `calibration.threshold` (mỗi nhãn) vào
 `stage2_metrics.json`; serving (FastAPI/Streamlit) đọc lại để biến logit thành xác suất

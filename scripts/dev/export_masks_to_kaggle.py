@@ -42,25 +42,31 @@ PACK_BYTES = IMG_SIZE * IMG_SIZE // 8  # 6272
 SPLITS = ("train", "val", "test")
 
 
-def load_masks(silver_dir: Path) -> dict[str, pd.DataFrame]:
-    """Đọc Parquet của precompute job, giữ nguyên cột split theo tên thư mục."""
-    per_split: dict[str, list[pd.DataFrame]] = {s: [] for s in SPLITS}
+def iter_splits(silver_dir: Path, write_pngs: Path | None = None):
+    """Yield (split, df) từng split một — không gom hết 112k rows vào RAM.
+
+    Chỉ đọc cột cần thiết (mask bits + chỉ số); cột PNG (~224 MB cho 112k)
+    chỉ đọc khi `--write-pngs`.
+    """
+    cols = ["image_index", "mask_lung_bits", "mask_heart_bits",
+            "n_fg_lung", "n_fg_heart", "dice_rca_mean"]
+    if write_pngs is not None:
+        cols += ["png_lung"]
+    found = False
     for split_dir in sorted(silver_dir.glob("**/split=*")):
         split = split_dir.name.split("=", 1)[1]
-        if split not in per_split:
+        if split not in SPLITS:
             continue
-        for f in sorted(split_dir.glob("*.parquet")):
-            per_split[split].append(pd.read_parquet(f))
-    result = {}
-    for split, frames in per_split.items():
-        if not frames:
+        files = sorted(split_dir.glob("*.parquet"))
+        if not files:
             continue
-        df = pd.concat(frames, ignore_index=True)
+        found = True
+        df = pd.concat([pd.read_parquet(f, columns=cols) for f in files],
+                       ignore_index=True)
         df["split"] = split
-        result[split] = df.sort_values("image_index").reset_index(drop=True)
-    if not result:
+        yield split, df.sort_values("image_index").reset_index(drop=True)
+    if not found:
         raise FileNotFoundError(f"Không thấy Parquet split=* trong {silver_dir}")
-    return result
 
 
 def unpack(bits: bytes) -> np.ndarray:
@@ -81,30 +87,38 @@ def validate(df: pd.DataFrame, n: int = 5) -> None:
         print(f"    {row['image_index']}: fg={got:,} ({frac:.1%}) [{flag}]")
 
 
-def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None) -> None:
-    data = load_masks(silver_dir)
+def pack_column(series: pd.Series) -> np.ndarray:
+    """Chuỗi bytes (n, 6272) -> ndarray uint8 (n, 6272).
+
+    `b"".join` gộp một lần rồi `np.frombuffer` zero-copy — thay cho
+    `np.stack([np.frombuffer(b).copy() ...])` tốn thêm 1 bản sao (112k rows
+    = ~0,5 GB mỗi cột).
+    """
+    raw = b"".join(series.to_numpy(dtype=object))
+    return np.frombuffer(raw, dtype=np.uint8).reshape(len(series), PACK_BYTES)
+
+
+def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None,
+          dataset_id: str = "chexspark-masks-224",
+          title: str = "CheXSpark Masks 224 (packed)") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     index_rows: list[dict] = []
-    for split in SPLITS:
-        df = data.get(split)
-        if df is None:
-            print(f"[WARN] thiếu split '{split}' — bỏ qua")
-            continue
-
+    seen: list[str] = []
+    for split, df in iter_splits(silver_dir, write_pngs):
+        seen.append(split)
         print(f"\n[{split}] {len(df)} mask")
         validate(df)
 
         for kind, col in (("", "mask_lung_bits"), ("heart_", "mask_heart_bits")):
-            pack = np.stack([
-                np.frombuffer(b, dtype=np.uint8).copy() for b in df[col]
-            ]).astype(np.uint8)
+            pack = pack_column(df[col])
             assert pack.shape == (len(df), PACK_BYTES), pack.shape
 
             npy_path = out_dir / f"masks_{kind}{split}.npy"
             np.save(npy_path, pack)
             print(f"  -> {npy_path.name} {pack.shape} "
                   f"{npy_path.stat().st_size / 1024**2:.1f} MB")
+            del pack
 
         for row_idx, row in enumerate(df.itertuples(index=False)):
             index_rows.append({
@@ -122,6 +136,11 @@ def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None) -> No
             for row, bits in zip(df.itertuples(index=False), df["png_lung"]):
                 (png_dir / f"{row.image_index}.png").write_bytes(bits)
             print(f"  -> {len(df)} PNG vào {png_dir}")
+        del df
+
+    missing = [s for s in SPLITS if s not in seen]
+    if missing:
+        print(f"[WARN] thiếu split {missing} — bỏ qua")
 
     index = pd.DataFrame(index_rows)
     index_path = out_dir / "mask_index.csv"
@@ -132,8 +151,8 @@ def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None) -> No
     print(f"Tổng masks .npy: {total_mb:.1f} MB ({total_mb / 1024:.2f} GB)")
 
     metadata = {
-        "title": "CheXSpark Masks 224 (packed)",
-        "id": "chexspark-masks-224",
+        "title": title,
+        "id": dataset_id,
         "licenses": [{"name": "CC0-1.0"}],
     }
     (out_dir / "dataset-metadata.json").write_text(
@@ -141,8 +160,8 @@ def build(silver_dir: Path, out_dir: Path, write_pngs: Path | None = None) -> No
     )
     (out_dir / "dataset_description.md").write_text(
         "# CheXSpark Masks 224 — mask phổi CheXmask đã precompute\n\n"
-        "Sinh bằng Spark (`src/silver/precompute_masks.py`) từ `silver/cxr14_masked`:\n"
-        "decode RLE 1024×1024 → OR left|right → resize 224×224 (NEAREST) → packbits.\n\n"
+        "Sinh bằng Spark (`src/silver/precompute_masks.py`) từ CheXmask RLE:\n"
+        "decode 1024×1024 → OR left|right → resize 224×224 (NEAREST) → packbits.\n\n"
         "- `masks_{split}.npy` — `uint8 (n, 6272)` = `np.packbits(mask phổi 224×224)`\n"
         "  (`.reshape(224,224)` sau `np.unpackbits`)\n"
         "- `masks_heart_{split}.npy` — cùng định dạng, mask **tim** (OR vào khi\n"
@@ -160,10 +179,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--silver-dir", type=Path, default=Path("data/tmp/silver_masks"))
     ap.add_argument("--out-dir", type=Path, default=Path("data/kaggle/stage2-masks-224"))
+    ap.add_argument("--dataset-id", default="chexspark-masks-224",
+                    help="id Kaggle dataset (vd pnt2005/chexspark-masks-224-112k)")
+    ap.add_argument("--title", default="CheXSpark Masks 224 (packed)",
+                    help="title dataset Kaggle (6..50 ký tự)")
     ap.add_argument("--write-pngs", type=Path, default=None,
                     help="xả PNG 224×224 ra thư mục này (xem bằng mắt)")
     args = ap.parse_args()
-    build(args.silver_dir, args.out_dir, args.write_pngs)
+    build(args.silver_dir, args.out_dir, args.write_pngs,
+          dataset_id=args.dataset_id, title=args.title)
 
 
 if __name__ == "__main__":

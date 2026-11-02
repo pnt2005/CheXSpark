@@ -323,6 +323,31 @@ def upload_dataset(kaggle: str, username: str, dataset_slug: str, dataset_dir: P
 # --------------------------------------------------------------------------- #
 # Kernel run
 # --------------------------------------------------------------------------- #
+def wait_for_kernel(kaggle: str, kernel_id: str, *, poll: int,
+                    wait_timeout: int) -> tuple[str, str]:
+    """Poll status của kernel trên Kaggle tới khi xong. Trả (status, kernel_id)."""
+    print(f"\nChờ kernel {kernel_id} (poll {poll}s, tối đa {wait_timeout // 60} phút) …")
+    start = time.time()
+    while time.time() - start < wait_timeout:
+        out = (run([kaggle, "kernels", "status", kernel_id], check=False).stdout or "").lower()
+        line = next((ln for ln in out.splitlines() if "kernelworkerstatus" in ln.lower()
+                     or "has status" in ln.lower()), "")
+        print(f"  [{int(time.time() - start):>4}s] {line.strip() or out.strip()[:120]}")
+
+        if "error" in out or "cancel" in out:
+            print("\nKernel lỗi — log cuối:")
+            logs = run([kaggle, "kernels", "logs", kernel_id], check=False).stdout or ""
+            print("\n".join(logs.splitlines()[-40:]))
+            return "error", kernel_id
+        if "complete" in out:
+            print("\nKernel chạy xong.")
+            return "complete", kernel_id
+        time.sleep(poll)
+
+    print("[WARN] Hết thời gian chờ — kernel có thể vẫn đang chạy.")
+    return "timeout", kernel_id
+
+
 def push_and_wait(kaggle: str, kernel_id: str, build_dir: Path, *,
                   accelerator: str | None, run_timeout: int, poll: int,
                   wait_timeout: int, no_wait: bool) -> tuple[str, str]:
@@ -348,26 +373,7 @@ def push_and_wait(kaggle: str, kernel_id: str, build_dir: Path, *,
         print(f"\nĐã push (không chờ). Theo dõi: kaggle kernels status {kernel_id}")
         return "queued", kernel_id
 
-    print(f"\nChờ kernel {kernel_id} (poll {poll}s, tối đa {wait_timeout // 60} phút) …")
-    start = time.time()
-    while time.time() - start < wait_timeout:
-        out = (run([kaggle, "kernels", "status", kernel_id], check=False).stdout or "").lower()
-        line = next((ln for ln in out.splitlines() if "kernelworkerstatus" in ln.lower()
-                     or "has status" in ln.lower()), "")
-        print(f"  [{int(time.time() - start):>4}s] {line.strip() or out.strip()[:120]}")
-
-        if "error" in out or "cancel" in out:
-            print("\nKernel lỗi — log cuối:")
-            logs = run([kaggle, "kernels", "logs", kernel_id], check=False).stdout or ""
-            print("\n".join(logs.splitlines()[-40:]))
-            return "error", kernel_id
-        if "complete" in out:
-            print("\nKernel chạy xong.")
-            return "complete", kernel_id
-        time.sleep(poll)
-
-    print("[WARN] Hết thời gian chờ — kernel có thể vẫn đang chạy.")
-    return "timeout", kernel_id
+    return wait_for_kernel(kaggle, kernel_id, poll=poll, wait_timeout=wait_timeout)
 
 
 def fetch_output(kaggle: str, kernel_id: str, out_dir: Path) -> Path:
@@ -473,6 +479,9 @@ def main() -> None:
     ap.add_argument("--poll", type=int, default=60, help="chu kỳ poll status (giây)")
     ap.add_argument("--wait-timeout", type=int, default=14400, help="thời gian chờ tối đa (giây)")
     ap.add_argument("--no-wait", action="store_true", help="push xong thoát, không chờ")
+    ap.add_argument("--wait-only", action="store_true",
+                    help="không upload/push — chỉ chờ kernel ĐÃ chạy trên Kaggle rồi "
+                         "tải output + đăng ký (dùng lại run bị gián đoạn lúc chờ)")
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--install", action="store_true",
                     help="copy checkpoint/metrics tải về vào notebooks/kaggle/")
@@ -544,17 +553,27 @@ def main() -> None:
         print(f"  {kaggle} kernels output {kernel_id} -p <output-dir>")
         return
 
-    if args.upload_dataset:
-        upload_dataset(kaggle, username, args.dataset_slug, args.dataset_dir,
-                       args.dataset_notes)
-    if args.upload_masks:
-        upload_dataset(kaggle, username, DEFAULT_MASKS_SLUG, args.masks_dir,
-                       "CheXSpark: mask precompute 224 (packed .npy + heart)")
+    if args.wait_only:
+        # Không upload/push lại: kernel đang chạy trên Kaggle rồi (lần push trước
+        # bị gián đoạn ở khâu chờ) -> chỉ poll rồi tải output + đăng ký như bình thường.
+        print(f"[wait-only] bỏ qua upload/push, chờ kernel {kernel_id}")
+        status, kernel_id = wait_for_kernel(kaggle, kernel_id, poll=args.poll,
+                                            wait_timeout=args.wait_timeout)
+    else:
+        if args.upload_dataset:
+            upload_dataset(kaggle, username, args.dataset_slug, args.dataset_dir,
+                           args.dataset_notes)
+        if args.upload_masks:
+            # Đẩy lên slug do --masks-dataset chỉ định (vd ...-112k), không phải
+            # mặc định chexspark-masks-224 — tránh vô tình ghi đè dataset dev.
+            masks_slug = args.masks_dataset or f"{username}/{DEFAULT_MASKS_SLUG}"
+            upload_dataset(kaggle, username, masks_slug, args.masks_dir,
+                           "CheXSpark: mask precompute 224 (packed .npy + heart)")
 
-    status, kernel_id = push_and_wait(kaggle, kernel_id, build_dir,
-                                     accelerator=args.accelerator, run_timeout=args.run_timeout,
-                                     poll=args.poll, wait_timeout=args.wait_timeout,
-                                     no_wait=args.no_wait)
+        status, kernel_id = push_and_wait(kaggle, kernel_id, build_dir,
+                                         accelerator=args.accelerator, run_timeout=args.run_timeout,
+                                         poll=args.poll, wait_timeout=args.wait_timeout,
+                                         no_wait=args.no_wait)
 
     out_dir = args.output_dir or (ROOT / "data/kaggle/output" / f"stage{args.stage}")
     if status != "complete":

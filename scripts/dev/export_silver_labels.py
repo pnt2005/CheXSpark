@@ -18,7 +18,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 
-def export(silver_dir: Path, out_path: Path) -> int:
+def export(silver_dir: Path, out_path: Path, drop: list[str] | None = None) -> int:
     frames = []
     for split_dir in sorted(silver_dir.glob("split=*")):
         split_value = split_dir.name.split("=", 1)[1]
@@ -31,6 +31,10 @@ def export(silver_dir: Path, out_path: Path) -> int:
         raise FileNotFoundError(f"Không tìm thấy Parquet trong {silver_dir}")
 
     merged = pd.concat(frames, ignore_index=True)
+    if drop:
+        cols = [c for c in drop if c in merged.columns]
+        merged = merged.drop(columns=cols)
+        print(f"Đã bỏ cột: {cols}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_csv(out_path, index=False)
 
@@ -45,8 +49,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--silver-dir", type=Path, default=Path("data/tmp/silver/cxr14"))
     ap.add_argument("--out", type=Path, default=Path("data/tmp/silver_labels.csv"))
+    ap.add_argument("--drop", nargs="*", default=[],
+                    help="cột cần loại khỏi CSV (vd: image_uri silver_ingested_at)")
     args = ap.parse_args()
-    export(args.silver_dir, args.out)
+    export(args.silver_dir, args.out, args.drop)
 
 
 if __name__ == "__main__":

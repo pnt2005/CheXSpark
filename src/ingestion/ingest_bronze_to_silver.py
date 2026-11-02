@@ -12,6 +12,10 @@ Usage (trong container spark-master):
     /opt/spark/bin/spark-submit \
         --master spark://spark-master:7077 --deploy-mode client \
         /opt/spark/user-src/ingestion/ingest_bronze_to_silver.py
+
+    # Toàn bộ 112k dòng (bỏ join manifest) -> silver/cxr14_full:
+    # nguồn labels/split cho việc train 112k + precompute_masks --source bronze
+    ... ingest_bronze_to_silver.py --full
 """
 
 from __future__ import annotations
@@ -43,6 +47,9 @@ DISEASES = [
 BRONZE_METADATA = "s3a://bronze/metadata/Data_Entry_2017_v2020.csv"
 BRONZE_MANIFEST = "s3a://bronze/images_manifest/images_manifest.csv"
 SILVER_OUT = "s3a://silver/cxr14"
+# `--full`: toàn bộ 112k dòng (labels + patient-level split) — dùng làm nguồn
+# split/labels cho việc train 112k. Khác `cxr14` (dev 2k, join manifest ảnh).
+SILVER_FULL_OUT = "s3a://silver/cxr14_full"
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 MLFLOW_EXPERIMENT = os.getenv("MLFLOW_EXPERIMENT", "chexspark-silver-ingestion")
 
@@ -135,6 +142,17 @@ def compute_full_stats(metadata_df):
 
 
 def main() -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Bronze metadata -> Silver Parquet")
+    ap.add_argument("--full", action="store_true",
+                    help="materialize toàn bộ 112k dòng (bỏ join manifest ảnh) "
+                         "ra silver/cxr14_full — nguồn labels/split cho train 112k")
+    ap.add_argument("--out", default=None,
+                    help="đường dẫn output Parquet (mặc định: cxr14 hoặc cxr14_full)")
+    args = ap.parse_args()
+    out = args.out or (SILVER_FULL_OUT if args.full else SILVER_OUT)
+
     spark = get_spark_session("chexspark-silver-ingestion")
     spark.sparkContext.setLogLevel("WARN")
 
@@ -142,11 +160,17 @@ def main() -> None:
     metadata = with_multihot_labels(load_metadata(spark))
     full_stats = compute_full_stats(metadata)
 
-    # 2) Dev subset: inner join metadata với manifest ảnh đã materialize (2k)
-    manifest = load_manifest(spark)
-    subset = metadata.join(F.broadcast(manifest), on="image_index", how="inner")
+    # 2) Dev subset: inner join metadata với manifest ảnh đã materialize (2k).
+    #    `--full` bỏ bước này -> tất cả 112k dòng (ảnh lấy từ Kaggle khi train).
+    if args.full:
+        subset = metadata
+        print("[full] bỏ join manifest -> materialize toàn bộ 112k dòng")
+    else:
+        manifest = load_manifest(spark)
+        subset = metadata.join(F.broadcast(manifest), on="image_index", how="inner")
 
-    # 3) Patient-level split (tránh rò rỉ bệnh nhân)
+    # 3) Patient-level split (tránh rò rỉ bệnh nhân) — hash(patient_id) cố định
+    #    nên dev 2k và full 112k luôn gán cùng một split cho cùng bệnh nhân.
     subset = patient_level_split(subset)
 
     # 4) Chuẩn bị cột output Silver
@@ -168,7 +192,7 @@ def main() -> None:
     # 5) Ghi Silver Parquet, partition theo split (train/val/test)
     (silver.write.mode("overwrite")
      .partitionBy("split")
-     .parquet(SILVER_OUT))
+     .parquet(out))
 
     subset_row = silver.agg(
         F.count(F.lit(1)).alias("subset_total_images"),
@@ -182,17 +206,20 @@ def main() -> None:
     print("=== FULL DATASET STATS (112k metadata) ===")
     for k, v in full_stats.items():
         print(f"  {k}: {v}")
-    print("=== DEV SUBSET STATS (materialized images) ===")
+    scope = "full" if args.full else "dev"
+    print(f"=== {'FULL 112k' if args.full else 'DEV SUBSET (materialized images)'} STATS ===")
     for k, v in subset_stats.items():
         print(f"  {k}: {v}")
+    print(f"Output: {out}")
 
     # 6) Log lên MLflow
-    log_to_mlflow(full_stats, subset_stats)
+    log_to_mlflow(full_stats, subset_stats, out=out, scope=scope)
 
     spark.stop()
 
 
-def log_to_mlflow(full_stats: dict, subset_stats: dict) -> None:
+def log_to_mlflow(full_stats: dict, subset_stats: dict, *, out: str,
+                  scope: str) -> None:
     """Ghi params/metrics lên MLflow tracking server (http://mlflow:5000)."""
     try:
         import mlflow
@@ -200,13 +227,15 @@ def log_to_mlflow(full_stats: dict, subset_stats: dict) -> None:
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
-        with mlflow.start_run(run_name=f"silver-ingest-{datetime.utcnow():%Y%m%d-%H%M%S}"):
+        with mlflow.start_run(run_name=f"silver-ingest-{scope}-{datetime.utcnow():%Y%m%d-%H%M%S}"):
             mlflow.log_params({
                 "dataset": "NIH ChestX-ray14",
                 "metadata_source": BRONZE_METADATA,
                 "split_strategy": "patient_level_hash_mod100",
                 "train_pct": 70, "val_pct": 15, "test_pct": 15,
                 "n_diseases": len(DISEASES),
+                "scope": scope,
+                "output": out,
             })
             # Log full stats + subset stats dưới dạng metrics
             all_metrics = {**full_stats, **subset_stats}

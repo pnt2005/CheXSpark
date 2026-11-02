@@ -210,10 +210,11 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
     nb_out = build_dir / cfg["notebook"].name
 
     values = dict(cfg["patch"])
-    values["IMG_ROOT"] = f"'/kaggle/input/{img_ref.split('/')[-1]}'"
-    values["META_ROOT"] = f"'/kaggle/input/{meta_ref.split('/')[-1]}'"
-    if masks_ref:
-        values["MASK_PACK_DIR"] = f"'/kaggle/input/{masks_ref.split('/')[-1]}'"
+    # Kaggle 2025+ mount dataset tại /kaggle/input/datasets/<owner>/<slug> -> notebook
+    # tự dò bằng resolve_input() nên chỉ cần truyền ref, không phải path tuyệt đối.
+    values["IMG_DS"] = f"'{img_ref}'"
+    values["META_DS"] = f"'{meta_ref}'"
+    values["MASKS_DS"] = f"'{masks_ref}'" if masks_ref else "''"
     if resume_ref:
         values["RESUME_FROM"] = (
             f"'/kaggle/input/{resume_ref.split('/')[-1]}/{cfg['last_checkpoint']}'"
@@ -311,16 +312,28 @@ def upload_dataset(kaggle: str, username: str, dataset_slug: str, dataset_dir: P
 # --------------------------------------------------------------------------- #
 def push_and_wait(kaggle: str, kernel_id: str, build_dir: Path, *,
                   accelerator: str | None, run_timeout: int, poll: int,
-                  wait_timeout: int, no_wait: bool) -> str:
-    """Push notebook và poll tới khi xong. Trả status cuối ('complete'|'error'|'queued')."""
+                  wait_timeout: int, no_wait: bool) -> tuple[str, str]:
+    """Push notebook và poll tới khi xong.
+
+    Trả (status, kernel_id) — kernel_id có thể KHÁC slug khai báo: khi kernel chưa
+    tồn tại, Kaggle tự sinh slug từ `title` (vd thêm hậu tố), nên phải đọc URL
+    trong output của `kernels push` rồi dùng slug thật để status/logs/output.
+    """
     cmd = [kaggle, "kernels", "push", "-p", str(build_dir), "--timeout", str(run_timeout)]
     if accelerator:
         cmd += ["--accelerator", accelerator]
-    run(cmd)
+    proc = run(cmd)
+
+    match = re.search(r"kaggle\.com/code/([\w.-]+/[\w.-]+)", proc.stdout or "")
+    if match:
+        real_id = match.group(1)
+        if real_id != kernel_id:
+            print(f"[INFO] Kaggle đặt slug '{real_id}' (khai báo '{kernel_id}') -> dùng slug thật")
+        kernel_id = real_id
 
     if no_wait:
         print(f"\nĐã push (không chờ). Theo dõi: kaggle kernels status {kernel_id}")
-        return "queued"
+        return "queued", kernel_id
 
     print(f"\nChờ kernel {kernel_id} (poll {poll}s, tối đa {wait_timeout // 60} phút) …")
     start = time.time()
@@ -334,14 +347,14 @@ def push_and_wait(kaggle: str, kernel_id: str, build_dir: Path, *,
             print("\nKernel lỗi — log cuối:")
             logs = run([kaggle, "kernels", "logs", kernel_id], check=False).stdout or ""
             print("\n".join(logs.splitlines()[-40:]))
-            return "error"
+            return "error", kernel_id
         if "complete" in out:
             print("\nKernel chạy xong.")
-            return "complete"
+            return "complete", kernel_id
         time.sleep(poll)
 
     print("[WARN] Hết thời gian chờ — kernel có thể vẫn đang chạy.")
-    return "timeout"
+    return "timeout", kernel_id
 
 
 def fetch_output(kaggle: str, kernel_id: str, out_dir: Path) -> Path:
@@ -525,10 +538,10 @@ def main() -> None:
         upload_dataset(kaggle, username, DEFAULT_MASKS_SLUG, args.masks_dir,
                        "CheXSpark: mask precompute 224 (packed .npy + heart)")
 
-    status = push_and_wait(kaggle, kernel_id, build_dir,
-                          accelerator=args.accelerator, run_timeout=args.run_timeout,
-                          poll=args.poll, wait_timeout=args.wait_timeout,
-                          no_wait=args.no_wait)
+    status, kernel_id = push_and_wait(kaggle, kernel_id, build_dir,
+                                     accelerator=args.accelerator, run_timeout=args.run_timeout,
+                                     poll=args.poll, wait_timeout=args.wait_timeout,
+                                     no_wait=args.no_wait)
 
     out_dir = args.output_dir or (ROOT / "data/kaggle/output" / f"stage{args.stage}")
     if status != "complete":

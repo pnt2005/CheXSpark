@@ -82,6 +82,10 @@ def main() -> None:
     ap.add_argument("--diseases", default="",
                     help="Danh sách bệnh cách nhau dấu phẩy (mặc định: cả 14)")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--from-registry", action="store_true",
+                    help="Nạp model theo alias từ MLflow Model Registry (bỏ qua --ckpt)")
+    ap.add_argument("--alias", default="production",
+                    help="Alias registry dùng khi có --from-registry")
     args = ap.parse_args()
 
     wanted = [d.strip() for d in args.diseases.split(",") if d.strip()] or DISEASES
@@ -92,9 +96,15 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     df = pd.read_csv(args.csv)
     test = df[df["split"] == args.split].reset_index(drop=True)
-    print(f"{args.split}: {len(test)} ảnh | ckpt={args.ckpt.name} | device={args.device}")
+    src = f"registry@{args.alias}" if args.from_registry else args.ckpt.name
+    print(f"{args.split}: {len(test)} ảnh | model={src} | device={args.device}")
 
-    model = load_stage2_model(args.ckpt, args.device)
+    if args.from_registry:
+        from mlops.registry import load_stage2_from_registry  # cần mlflow (venv-mlops)
+
+        model = load_stage2_from_registry(alias=args.alias, device=args.device)
+    else:
+        model = load_stage2_model(args.ckpt, args.device)
     target_layer = getattr(model.features, args.target)
     probs = predict_all(model, test, args.images_dir, args.device)
 

@@ -33,7 +33,8 @@ CheXSpark/
 ├── dags/                         # Airflow DAGs (Bronze→Silver→Gold)
 ├── infra/
 │   ├── postgres/init/            # SQL bootstrap (mlflow, chexspark_metadata, airflow)
-│   ├── airflow/Dockerfile        # Build image chexspark-airflow (PySpark + Spark provider)
+│   ├── airflow/Dockerfile        # Build image chexspark-airflow (PySpark + Spark provider + mlflow)
+│   ├── mlflow/Dockerfile         # Image MLflow + psycopg2 (Postgres) + boto3 (MinIO)
 │   └── spark/
 │       ├── Dockerfile            # Build image chexspark-spark (S3A jars + mlflow)
 │       ├── jars/                 # hadoop-aws + aws-java-sdk-bundle (cho S3A/MinIO)
@@ -44,6 +45,7 @@ CheXSpark/
 │   ├── silver/                   # (sẵn sàng) cleaning, stratified split
 │   ├── gold/                     # co-occurrence, disease network, MLlib PCA/K-Means/LR/RF
 │   ├── dl/                       # preprocess, DenseNet121 loader, Grad-CAM (PyTorch)
+│   ├── mlops/                    # MLflow Model Registry (register/promote/load theo alias)
 │   └── serving/                  # FastAPI inference + Streamlit UI
 ├── notebooks/
 │   └── kaggle/stage2_densenet121.ipynb   # Train Stage-2 trên Kaggle GPU
@@ -331,6 +333,9 @@ python scripts/dev/run_gradcam_batch.py --top-k 4
 
 # Chỉ vài bệnh, hoặc đổi lớp đích (denseblock3 = 14x14 nét hơn, denseblock4 = 7x7)
 python scripts/dev/run_gradcam_batch.py --diseases Cardiomegaly,Effusion --target denseblock4
+
+# Nạp model theo alias từ MLflow Model Registry thay vì file .pth
+python scripts/dev/run_gradcam_batch.py --from-registry --alias production
 ```
 
 **Module tái sử dụng** (dùng lại cho FastAPI/Streamlit):
@@ -339,6 +344,7 @@ python scripts/dev/run_gradcam_batch.py --diseases Cardiomegaly,Effusion --targe
 - `src/dl/model.py` — build/load DenseNet121 từ checkpoint Stage-2
 - `src/dl/gradcam.py` — `GradCAM` class (forward/backward hook), colormap `jet`
   thuần numpy, `overlay_heatmap` (chỉ giữ CAM trong vùng phổi)
+- `src/mlops/registry.py` — đăng ký/promote/nạp model Stage-2 qua MLflow Model Registry
 
 **Output** `data/outputs/gradcam/`:
 - `gradcam_<Disease>.png` — contact sheet top-K: `[ảnh gốc | mask phổi | Grad-CAM | overlay]`
@@ -419,6 +425,83 @@ RAM với 2 Spark worker.
 > **Lưu ý**: `chexspark_pipeline` chỉ chạy phần **data pipeline** (Bronze→Gold).
 > Train Stage-2 (DenseNet121) và Stage-3 (Grad-CAM) chạy trên Kaggle GPU / local
 > vì cần GPU, không đưa vào Airflow.
+
+## MLOps: MLflow Model Registry
+
+Checkpoint Stage-2 không trỏ bằng đường dẫn file mà **đăng ký thành model version**
+trong MLflow. Mỗi lần train (kể cả trên Kaggle) đăng ký một version bất biến, gắn
+đúng run + params + metrics của lần train đó; serving luôn nạp theo **alias** nên
+promote/rollback không cần sửa code.
+
+| Thành phần | Giá trị |
+|---|---|
+| Registered model | `chexspark-stage2-densenet121` |
+| Experiment | `chexspark-stage2-registry` |
+| Alias | `production` (URI: `models:/chexspark-stage2-densenet121@production`) |
+| Metadata | PostgreSQL (`mlflow` DB) |
+| Artifact | MinIO `s3://mlflow/…` (model ~27 MB) |
+
+**Đăng ký + promote + kiểm chứng**
+
+```powershell
+$env:MLFLOW_TRACKING_URI="http://localhost:5000"   # chỉ cần tracking URI
+
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py
+```
+
+Server chạy ở chế độ **artifact proxy** (`--serve-artifacts --artifacts-destination s3://mlflow
+--default-artifact-root mlflow-artifacts:/`): client đẩy artifact qua endpoint
+`/api/2.0/mlflow-artifacts/…` của server, server mới ghi lên MinIO. Nhờ vậy máy
+train/serving **không cần** `boto3` hay credential MinIO.
+
+Script làm 4 việc: log run (params + mAUROC toàn cục và từng bệnh), log model kèm
+**signature** `(1,3,224,224) → (1,14)`, gán alias `production`, rồi **nạp lại từ
+registry** và so sánh logits với checkpoint local (lệch phải < 1e-5).
+
+**Promote / rollback version khác**
+
+```powershell
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py --list
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py --promote 1
+```
+
+**Serving nạp model theo alias** (`src/mlops/registry.py`)
+
+```python
+from mlops.registry import load_stage2_from_registry
+
+model = load_stage2_from_registry()        # models:/chexspark-stage2-densenet121@production
+```
+
+**Trạng thái registry sau khi chạy**
+
+| version | checkpoint | alias | val mAUROC | test mAUROC |
+|---|---|---|---|---|
+| 1 | `best_stage2_densenet121.pth` | **production** | 0.6752 | 0.6269 |
+| 2 | `stage2_densenet121_final.pth` | – | – | – |
+
+Version 2 (epoch cuối) được đăng ký để thử promote rồi **rollback** về version 1
+(best theo val) bằng `--promote 1`. Kiểm chứng nạp từ registry cho
+`max |logit_local − logit_registry| = 0.000e+00`, output `(1, 14)` sau sigmoid
+nằm trong `[0.057, 0.687]`.
+
+**Ghi chú thiết kế**
+- `venv-mlops` tách riêng vì `mlflow==2.9.2` (khớp server) pin `numpy<2`/`pandas<3`,
+  không nên trộn vào venv train/Grad-CAM đang dùng numpy 2.x.
+- Alias là cơ chế promote hiện đại; *stages* (`Staging`/`Production`) đã deprecated
+  từ MLflow 2.9 nên không dùng.
+- Signature + `pip_requirements` (`torch`, `torchvision`, `numpy`) được log kèm để
+  model tái lập được ở môi trường khác, không phụ thuộc máy train.
+- Image `chexspark-mlflow:2.9.2` (`infra/mlflow/Dockerfile`) = image chính thức +
+  `psycopg2-binary` (backend PostgreSQL) + `boto3` (artifact MinIO). Image gốc
+  thiếu cả hai, khi đó MLflow **âm thầm** rơi về sqlite + filesystem trong container
+  và mất sạch metadata/artifact mỗi lần recreate.
+- Image Airflow cài thêm `mlflow==2.9.2` vì driver Spark (client mode) chạy *trong*
+  container Airflow: thiếu nó job vẫn báo success nhưng in
+  `[WARN] MLflow logging failed` và bỏ qua toàn bộ tracking.
+- Train Stage-2 chạy trên GPU Kaggle nên **đăng ký model là bước riêng** (thủ công
+  hoặc CI) sau khi tải checkpoint về, không nằm trong DAG Spark — DAG chỉ lo dữ
+  liệu Bronze→Gold.
 
 ## Ghi chú
 

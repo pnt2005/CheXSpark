@@ -88,7 +88,7 @@ STAGES = {
     1: {
         "notebook": ROOT / "notebooks/kaggle/stage1_unet_segmentation.ipynb",
         "kernel_slug": "chexspark-stage1-unet",
-        "title": "CheXSpark Stage1 U-Net lung segmentation",
+        "title": "CheXSpark Stage1 UNet",
         "metrics": "stage1_metrics.json",
         "checkpoint": "best_stage1_unet.pth",
         "last_checkpoint": "last_stage1_unet.pth",
@@ -99,7 +99,7 @@ STAGES = {
     2: {
         "notebook": ROOT / "notebooks/kaggle/stage2_densenet121.ipynb",
         "kernel_slug": "chexspark-stage2-densenet121",
-        "title": "CheXSpark Stage2 DenseNet121 multi-label",
+        "title": "CheXSpark Stage2 DenseNet121",
         "metrics": "stage2_metrics.json",
         "checkpoint": "best_stage2_densenet121.pth",
         "last_checkpoint": "last_stage2_densenet121.pth",
@@ -196,10 +196,23 @@ def patch_notebook(nb_path: Path, values: dict[str, str], out_path: Path) -> lis
     return changed
 
 
+def slugify_title(text: str) -> str:
+    """Kaggle tự sinh slug kernel từ title (giống Clean URL): lowercase, gạch nối."""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
 def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
                      overrides: dict[str, str]) -> Path:
     """Tạo `data/kaggle/kernels/stageN/` gồm notebook (đã patch) + kernel-metadata.json."""
     slug = cfg["kernel_slug"] if not overrides.get("kernel_slug") else overrides["kernel_slug"]
+    title = cfg["title"]
+    # Kaggle từ chối push (409 Conflict) nếu slug(title) != id trong metadata,
+    # nên luôn chỉnh title cho khớp slug mong muốn.
+    if slugify_title(title) != slug:
+        fixed = slug.replace("-", " ")
+        print(f"[WARN] title {title!r} -> slug {slugify_title(title)!r} != id {slug!r}; "
+              f"dùng title {fixed!r}")
+        title = fixed
     img_ref = overrides.get("image_dataset") or IMAGE_DATASET
     meta_ref = f"{username}/{dataset_slug.split('/')[-1]}"
     masks_ref = overrides.get("masks_dataset")
@@ -234,7 +247,7 @@ def build_kernel_dir(stage: int, cfg: dict, username: str, dataset_slug: str,
     dataset_sources = [img_ref, meta_ref] + ([masks_ref] if masks_ref else [])
     metadata = {
         "id": kernel_id,
-        "title": cfg["title"],
+        "title": title,
         "code_file": nb_out.name,
         "language": "python",
         "kernel_type": "notebook",

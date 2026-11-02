@@ -1,0 +1,133 @@
+{
+  "best_val_dice": 0.9441562294960022,
+  "test": {
+    "dice_mean": 0.946051836013794,
+    "dice_median": 0.9639135003089905,
+    "dice_p10": 0.8885877132415771,
+    "iou_mean": 0.9015079802374087,
+    "frac_dice_ge_07": 0.9941860465116279
+  },
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.44205636072158816,
+      "val_dice_mean": 0.8570729494094849,
+      "val_dice_median": 0.893775463104248,
+      "val_dice_p10": 0.6873241066932678,
+      "val_iou_mean": 0.7620017829118964,
+      "val_frac_dice_ge_07": 0.8878504672897196
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.29639900267124175,
+      "val_dice_mean": 0.9078629612922668,
+      "val_dice_median": 0.937967836856842,
+      "val_dice_p10": 0.7725409865379333,
+      "val_iou_mean": 0.8398535308102252,
+      "val_frac_dice_ge_07": 0.9532710280373832
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.2076960828304291,
+      "val_dice_mean": 0.8974403738975525,
+      "val_dice_median": 0.935836136341095,
+      "val_dice_p10": 0.7443022131919861,
+      "val_iou_mean": 0.8254099515573657,
+      "val_frac_dice_ge_07": 0.9252336448598131
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.15496666407585144,
+      "val_dice_mean": 0.9233338832855225,
+      "val_dice_median": 0.9587571024894714,
+      "val_dice_p10": 0.780265212059021,
+      "val_iou_mean": 0.8678611135447444,
+      "val_frac_dice_ge_07": 0.9501557632398754
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.12126864695549011,
+      "val_dice_mean": 0.9016415476799011,
+      "val_dice_median": 0.9436264038085938,
+      "val_dice_p10": 0.742465615272522,
+      "val_iou_mean": 0.8348976401727229,
+      "val_frac_dice_ge_07": 0.9314641744548287
+    },
+    {
+      "epoch": 6,
+      "train_loss": 0.10621432673931122,
+      "val_dice_mean": 0.9324120283126831,
+      "val_dice_median": 0.9624672532081604,
+      "val_dice_p10": 0.8204391002655029,
+      "val_iou_mean": 0.8814223171738989,
+      "val_frac_dice_ge_07": 0.9750778816199377
+    },
+    {
+      "epoch": 7,
+      "train_loss": 0.09364052337408066,
+      "val_dice_mean": 0.9354550242424011,
+      "val_dice_median": 0.9631998538970947,
+      "val_dice_p10": 0.8354377150535583,
+      "val_iou_mean": 0.8856574005281689,
+      "val_frac_dice_ge_07": 0.9813084112149533
+    },
+    {
+      "epoch": 8,
+      "train_loss": 0.08604144430160522,
+      "val_dice_mean": 0.9380310773849487,
+      "val_dice_median": 0.9665126204490662,
+      "val_dice_p10": 0.8505717515945435,
+      "val_iou_mean": 0.8902470290921709,
+      "val_frac_dice_ge_07": 0.9813084112149533
+    },
+    {
+      "epoch": 9,
+      "train_loss": 0.0809112069606781,
+      "val_dice_mean": 0.9378759860992432,
+      "val_dice_median": 0.9686383605003357,
+      "val_dice_p10": 0.8267323970794678,
+      "val_iou_mean": 0.8906879818681311,
+      "val_frac_dice_ge_07": 0.9750778816199377
+    },
+    {
+      "epoch": 10,
+      "train_loss": 0.07501048970222474,
+      "val_dice_mean": 0.9419264793395996,
+      "val_dice_median": 0.9691698551177979,
+      "val_dice_p10": 0.8576679825782776,
+      "val_iou_mean": 0.8965645702154723,
+      "val_frac_dice_ge_07": 0.9813084112149533
+    },
+    {
+      "epoch": 11,
+      "train_loss": 0.07236649751663209,
+      "val_dice_mean": 0.9433612823486328,
+      "val_dice_median": 0.9682163000106812,
+      "val_dice_p10": 0.8581936955451965,
+      "val_iou_mean": 0.8982119586751749,
+      "val_frac_dice_ge_07": 0.9875389408099688
+    },
+    {
+      "epoch": 12,
+      "train_loss": 0.07127627894282342,
+      "val_dice_mean": 0.9441562294960022,
+      "val_dice_median": 0.9695602059364319,
+      "val_dice_p10": 0.8607855439186096,
+      "val_iou_mean": 0.8998537650870951,
+      "val_frac_dice_ge_07": 0.9875389408099688
+    }
+  ],
+  "config": {
+    "arch": "unet",
+    "base": 16,
+    "img_size": 224,
+    "epochs": 12,
+    "batch_size": 8,
+    "lr": 0.001,
+    "n_train": 500,
+    "n_val": 321,
+    "n_test": 344,
+    "loss": "BCEDiceLoss",
+    "ground_truth": "CheXmask (left|right, không gồm heart)"
+  }
+}

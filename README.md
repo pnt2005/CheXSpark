@@ -44,14 +44,14 @@ CheXSpark/
 │   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, mask join, verify)
 │   ├── silver/                   # (sẵn sàng) cleaning, stratified split
 │   ├── gold/                     # co-occurrence, disease network, MLlib PCA/K-Means/LR/RF
-│   ├── dl/                       # preprocess, DenseNet121 loader, Grad-CAM (PyTorch)
+│   ├── dl/                       # U-Net (Stage-1), DenseNet121 + Grad-CAM (Stage-2/3), preprocess
 │   ├── mlops/                    # MLflow Model Registry (register/promote/load theo alias)
 │   └── serving/                  # FastAPI inference + Streamlit UI
 ├── notebooks/
-│   └── kaggle/stage2_densenet121.ipynb   # Train Stage-2 trên Kaggle GPU
+│   └── kaggle/                   # stage1_unet_segmentation.ipynb (U-Net) + stage2_densenet121.ipynb
 ├── tests/                        # Unit & integration tests
 └── scripts/
-    └── dev/                      # extract_subset, export Silver→Kaggle, features, Grad-CAM, smoke tests
+    └── dev/                      # extract_subset, export Silver→Kaggle, train/eval Stage-1, features, Grad-CAM, registry
 ```
 
 ## Cách chạy
@@ -207,7 +207,80 @@ Output `data/kaggle/stage2-nih-dev/` (upload lên Kaggle làm dataset) — gắn
 `notebooks/kaggle/stage2_densenet121.ipynb` + dataset ảnh
 `khanfashee/nih-chest-x-ray-14-224x224-resized` để train Stage-2.
 
-### 6. Gold layer — phân tích dịch tễ & mạng bệnh lý (Spark)
+### 6. Stage-1 — U-Net phân đoạn phổi (Lung Segmentation)
+
+Giai đoạn 1 của pipeline học sâu: sinh mask phổi từ **ảnh X-quang thô**, thay cho
+CheXmask ở thời điểm suy luận (CheXmask chỉ tồn tại cho NIH, không có khi bệnh viện
+gửi ảnh mới).
+
+- Kiến trúc: U-Net 4 tầng xuống (`src/dl/segmentation.py`), base=16 → **1.94M tham số**
+  (GPU/Kaggle dùng base=32)
+- Ground truth: CheXmask (`mask_left_rle | mask_right_rle`, **không** gồm tim)
+- Loss: `BCE + Dice` (Dice tính từng ảnh để ảnh phổi to không lấn át ảnh nhỏ)
+- Dữ liệu: dùng lại **cùng** `stage2_train.csv` đã export ở mục 5 — không cần export mới
+
+```powershell
+# Train trên máy local (CPU) — dev subset
+python scripts/dev/train_stage1_unet.py --limit 500 --epochs 12
+
+# Train đầy đủ trên GPU: dùng notebook Kaggle
+#   notebooks/kaggle/stage1_unet_segmentation.ipynb  (base=32, 30 epoch)
+```
+
+Đánh giá so với mask CheXmask trên tập test (Dice/IoU từng ảnh + 4 ca tệ nhất):
+
+```powershell
+python scripts/dev/evaluate_stage1_segmentation.py --split test --viz 4
+# -> data/outputs/stage1/stage1_eval_test.csv + stage1_worst_test.png
+```
+
+Output: `notebooks/kaggle/best_stage1_unet.pth` + `stage1_metrics.json`.
+
+**Kết quả trên 500 ảnh train / 321 val / 344 test (CPU, 12 epoch, base=16):**
+
+| Chỉ số | Val | Test |
+|---|---|---|
+| Dice mean | 0.9442 | **0.9461** |
+| Dice median | 0.9696 | 0.9639 |
+| Dice p10 | 0.8608 | 0.8886 |
+| IoU mean | 0.8999 | 0.9015 |
+| % ảnh Dice ≥ 0.7 | 98.8% | **99.4%** |
+| % ảnh Dice ≥ 0.9 | – | 86.1% |
+
+- Dice tăng 0.857 (epoch 1) → 0.944 (epoch 12); chỉ 500 ảnh đã đủ vì phổi là cấu trúc
+  tương phản cao, 1 lớp — khác hẳn Stage-2 (phân loại bệnh, mAUROC 0.627) vốn cần
+  nhiều dữ liệu hơn.
+- Ca tệ nhất (Dice 0.635) là ảnh mà **CheXmask GT mở rộng quá tay** sang trung thất/
+  góc sườn hoành; U-Net cắt sát phổi hơn nên lệch chủ yếu ở **biên**, không ca nào
+  mất hẳn một bên phổi → xem `data/outputs/stage1/stage1_worst_test.png`
+- Model đã đăng ký MLflow Registry: `chexspark-stage1-unet` version 1, alias
+  `production` (verify logits khớp file local, lệch 0.0)
+
+**Ablation — thay CheXmask bằng mask U-Net thì Stage-2 có tụt không?**
+(`scripts/dev/compare_mask_sources.py`, chạy DenseNet121 2 lượt trên cùng tập test)
+
+| Chỉ số | CheXmask (GT) | Mask U-Net | Δ |
+|---|---|---|---|
+| mAUROC 14 bệnh | 0.6279 | 0.6033 | **−0.0247** |
+| mean \|Δp\| | – | – | 0.061 |
+
+- Giảm mạnh nhất: **Pleural_Thickening −0.152**, **Mass −0.106**, Emphysema −0.066,
+  Cardiomegaly −0.032 (mask mất vùng tim — khớp nhận xét ở Grad-CAM)
+- Tăng: Edema +0.078, Nodule +0.047, Pneumothorax +0.035
+- Đọc kết quả: mask U-Net "sát phổi" hơn CheXmask (vốn rộng tay ở trung thất) nên
+  thay đổi xác suất trung bình 0.061 và mAUROC mất ~0.025 — **chất lượng mask không
+  phải nút thắt** của Stage-2; nút thắt là dữ liệu/độ phân giải tổn thương. Muốn cải
+  thiện Cardiomegaly thì phải dùng `MASK_MODE='lungs_heart'` chứ không phải mask nét hơn.
+
+**Nối Stage-1 vào Stage-3** (chạy đủ chuỗi U-Net → mask → DenseNet121 → Grad-CAM):
+
+```powershell
+python scripts/dev/run_gradcam_batch.py --diseases Effusion --mask-source unet
+# hoặc lấy cả 2 model từ registry
+python scripts/dev/run_gradcam_batch.py --from-registry --mask-source unet --stage1-from-registry
+```
+
+### 7. Gold layer — phân tích dịch tễ & mạng bệnh lý (Spark)
 
 Gold layer chạy trên **full metadata 112,120 ảnh** (không chỉ 2k dev) nên các con
 số thống kê/đồ thị dùng trực tiếp cho báo cáo.
@@ -276,7 +349,7 @@ docker exec chexspark-spark-master /opt/spark/bin/spark-submit `
 detection dùng **greedy modularity (Clauset-Newman-Moore)** chạy trên driver sau khi
 collect — tương đương GraphX cho use-case này và tất định (seed cố định).
 
-### 7. Gold layer — MLlib trên feature vectors DenseNet121
+### 8. Gold layer — MLlib trên feature vectors DenseNet121
 
 ```powershell
 # 7a. Trích 1024-d features từ checkpoint Stage-2 (preprocessing giống lúc train:
@@ -321,7 +394,7 @@ Output: `gold/mllib/pca_variance`, `pca_points` (scatter 2D + nhãn cụm),
 > lý rõ — nhất quán với mAU còn thấp; cần model/dữ liệu tốt hơn trước khi kỳ vọng
 > cụm bệnh lý tách bạch.
 
-### 8. Stage-3 — Grad-CAM (Explainability)
+### 9. Stage-3 — Grad-CAM (Explainability)
 
 Sinh bản đồ nhiệt từ feature map tích chập cuối của DenseNet121 để khoanh vùng
 tổn thương nghi ngờ cho từng bệnh (output thứ 3 của hệ thống, cạnh mask phổi và
@@ -428,25 +501,26 @@ RAM với 2 Spark worker.
 
 ## MLOps: MLflow Model Registry
 
-Checkpoint Stage-2 không trỏ bằng đường dẫn file mà **đăng ký thành model version**
-trong MLflow. Mỗi lần train (kể cả trên Kaggle) đăng ký một version bất biến, gắn
-đúng run + params + metrics của lần train đó; serving luôn nạp theo **alias** nên
+Checkpoint không trỏ bằng đường dẫn file mà **đăng ký thành model version** trong
+MLflow. Mỗi lần train (kể cả trên Kaggle) đăng ký một version bất biến, gắn đúng
+run + params + metrics của lần train đó; serving luôn nạp theo **alias** nên
 promote/rollback không cần sửa code.
 
-| Thành phần | Giá trị |
-|---|---|
-| Registered model | `chexspark-stage2-densenet121` |
-| Experiment | `chexspark-stage2-registry` |
-| Alias | `production` (URI: `models:/chexspark-stage2-densenet121@production`) |
-| Metadata | PostgreSQL (`mlflow` DB) |
-| Artifact | MinIO `s3://mlflow/…` (model ~27 MB) |
+| Stage | Registered model | Experiment | Artifact |
+|---|---|---|---|
+| 1 — U-Net | `chexspark-stage1-unet` | `chexspark-stage1-registry` | MinIO `s3://mlflow/…` (~8 MB) |
+| 2 — DenseNet121 | `chexspark-stage2-densenet121` | `chexspark-stage2-registry` | MinIO `s3://mlflow/…` (~27 MB) |
+
+Alias chung: `production` (URI `models:/<tên>@production`); metadata ở PostgreSQL
+(`mlflow` DB).
 
 **Đăng ký + promote + kiểm chứng**
 
 ```powershell
 $env:MLFLOW_TRACKING_URI="http://localhost:5000"   # chỉ cần tracking URI
 
-D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_model.py --stage 1   # U-Net
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_model.py --stage 2   # DenseNet121
 ```
 
 Server chạy ở chế độ **artifact proxy** (`--serve-artifacts --artifacts-destination s3://mlflow
@@ -454,23 +528,25 @@ Server chạy ở chế độ **artifact proxy** (`--serve-artifacts --artifacts
 `/api/2.0/mlflow-artifacts/…` của server, server mới ghi lên MinIO. Nhờ vậy máy
 train/serving **không cần** `boto3` hay credential MinIO.
 
-Script làm 4 việc: log run (params + mAUROC toàn cục và từng bệnh), log model kèm
-**signature** `(1,3,224,224) → (1,14)`, gán alias `production`, rồi **nạp lại từ
-registry** và so sánh logits với checkpoint local (lệch phải < 1e-5).
+Script làm 4 việc: log run (params + metric chính của stage), log model kèm
+**signature** (`(1,3,224,224) → (1,14)` cho Stage-2, `(1,1,224,224) → (1,1,224,224)`
+cho Stage-1), gán alias `production`, rồi **nạp lại từ registry** và so sánh logits
+với checkpoint local (lệch phải < 1e-5).
 
 **Promote / rollback version khác**
 
 ```powershell
-D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py --list
-D:\BigData\venv-mlops\Scripts\python scripts/dev/register_stage2_model.py --promote 1
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_model.py --stage 2 --list
+D:\BigData\venv-mlops\Scripts\python scripts/dev/register_model.py --stage 2 --promote 1
 ```
 
 **Serving nạp model theo alias** (`src/mlops/registry.py`)
 
 ```python
-from mlops.registry import load_stage2_from_registry
+from mlops.registry import load_stage1_from_registry, load_stage2_from_registry
 
-model = load_stage2_from_registry()        # models:/chexspark-stage2-densenet121@production
+unet = load_stage1_from_registry()      # models:/chexspark-stage1-unet@production
+model = load_stage2_from_registry()     # models:/chexspark-stage2-densenet121@production
 ```
 
 **Trạng thái registry sau khi chạy**

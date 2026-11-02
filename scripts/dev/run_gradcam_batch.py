@@ -32,19 +32,21 @@ sys.path.insert(0, str(ROOT / "src"))
 from dl.gradcam import GradCAM, jet_rgb, mask_visual, overlay_heatmap, to_pil, upsample_cam  # noqa: E402
 from dl.model import load_stage2_model  # noqa: E402
 from dl.preprocess import DISEASES, build_tensor, load_gray, lung_mask  # noqa: E402
+from dl.segmentation import load_stage1_model, predict_mask  # noqa: E402
 
 PANEL = 224
 
 
 def predict_all(model, df: pd.DataFrame, images_dir: Path, device: str,
-                batch_size: int = 32) -> np.ndarray:
+                mask_fn=None, batch_size: int = 32) -> np.ndarray:
     probs = np.zeros((len(df), len(DISEASES)), dtype=np.float32)
     for start in range(0, len(df), batch_size):
         chunk = df.iloc[start:start + batch_size]
-        tensors = [
-            build_tensor(load_gray(images_dir / row["image_index"]), lung_mask(row))
-            for _, row in chunk.iterrows()
-        ]
+        tensors = []
+        for _, row in chunk.iterrows():
+            gray = load_gray(images_dir / row["image_index"])
+            mask = mask_fn(row, gray) if mask_fn else lung_mask(row)
+            tensors.append(build_tensor(gray, mask))
         x = torch.cat(tensors).to(device)
         with torch.no_grad():
             probs[start:start + len(chunk)] = torch.sigmoid(model(x)).cpu().numpy()
@@ -86,6 +88,12 @@ def main() -> None:
                     help="Nạp model theo alias từ MLflow Model Registry (bỏ qua --ckpt)")
     ap.add_argument("--alias", default="production",
                     help="Alias registry dùng khi có --from-registry")
+    ap.add_argument("--mask-source", choices=("chexmask", "unet"), default="chexmask",
+                    help="chexmask = mask GT CheXmask; unet = do U-Net Stage-1 tự sinh")
+    ap.add_argument("--stage1-ckpt", type=Path,
+                    default=ROOT / "notebooks/kaggle/best_stage1_unet.pth")
+    ap.add_argument("--stage1-from-registry", action="store_true",
+                    help="Nạp U-Net Stage-1 từ MLflow Registry thay vì --stage1-ckpt")
     args = ap.parse_args()
 
     wanted = [d.strip() for d in args.diseases.split(",") if d.strip()] or DISEASES
@@ -105,8 +113,30 @@ def main() -> None:
         model = load_stage2_from_registry(alias=args.alias, device=args.device)
     else:
         model = load_stage2_model(args.ckpt, args.device)
+
+    # Nguồn mask phổi: CheXmask (GT, dùng lúc đánh giá) hoặc U-Net Stage-1 tự sinh
+    # (đúng kịch bản triển khai: ảnh mới từ bệnh viện không có CheXmask).
+    if args.mask_source == "unet":
+        if args.stage1_from_registry:
+            from mlops.registry import load_stage1_from_registry
+
+            seg = load_stage1_from_registry(alias=args.alias, device=args.device)
+            seg_src = f"stage1@registry:{args.alias}"
+        else:
+            seg = load_stage1_model(args.stage1_ckpt, args.device)
+            seg_src = args.stage1_ckpt.name
+        print(f"mask source: U-Net ({seg_src})")
+
+        def mask_fn(row, gray):
+            return predict_mask(seg, gray, args.device)
+    else:
+        print("mask source: CheXmask (ground truth)")
+
+        def mask_fn(row, gray):
+            return lung_mask(row)
+
     target_layer = getattr(model.features, args.target)
-    probs = predict_all(model, test, args.images_dir, args.device)
+    probs = predict_all(model, test, args.images_dir, args.device, mask_fn=mask_fn)
 
     index_rows = []
     with GradCAM(model, target_layer) as cam_gen:
@@ -126,7 +156,7 @@ def main() -> None:
             for i in chosen:
                 row = test.iloc[i]
                 gray = load_gray(args.images_dir / row["image_index"])
-                mask = lung_mask(row)
+                mask = mask_fn(row, gray)
                 x = build_tensor(gray, mask).to(args.device)
 
                 cam = cam_gen.generate(x, d_idx)

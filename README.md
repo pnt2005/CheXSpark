@@ -37,14 +37,14 @@ CheXSpark/
 │   ├── common/spark_session.py   # SparkSession factory (dùng chung mọi job)
 │   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, mask join, verify)
 │   ├── silver/                   # (sẵn sàng) cleaning, stratified split
-│   ├── gold/                     # GraphX co-occurrence, MLlib PCA/K-Means/LR/RF
-│   ├── dl/                       # U-Net, DenseNet121, Grad-CAM (PyTorch)
+│   ├── gold/                     # co-occurrence, disease network, MLlib PCA/K-Means/LR/RF
+│   ├── dl/                       # preprocess, DenseNet121 loader, Grad-CAM (PyTorch)
 │   └── serving/                  # FastAPI inference + Streamlit UI
 ├── notebooks/
 │   └── kaggle/stage2_densenet121.ipynb   # Train Stage-2 trên Kaggle GPU
 ├── tests/                        # Unit & integration tests
 └── scripts/
-    └── dev/                      # extract_subset, export Silver→Kaggle, smoke tests
+    └── dev/                      # extract_subset, export Silver→Kaggle, features, Grad-CAM, smoke tests
 ```
 
 ## Cách chạy
@@ -312,6 +312,48 @@ Output: `gold/mllib/pca_variance`, `pca_points` (scatter 2D + nhãn cụm),
 > tăng epoch. Silhouette thấp (0.156) cho thấy feature space chưa phân tách bệnh
 > lý rõ — nhất quán với mAU còn thấp; cần model/dữ liệu tốt hơn trước khi kỳ vọng
 > cụm bệnh lý tách bạch.
+
+### 8. Stage-3 — Grad-CAM (Explainability)
+
+Sinh bản đồ nhiệt từ feature map tích chập cuối của DenseNet121 để khoanh vùng
+tổn thương nghi ngờ cho từng bệnh (output thứ 3 của hệ thống, cạnh mask phổi và
+danh sách xác suất).
+
+```powershell
+# Toàn bộ 14 bệnh, top-4 ca dương tính rõ nhất trong test
+python scripts/dev/run_gradcam_batch.py --top-k 4
+
+# Chỉ vài bệnh, hoặc đổi lớp đích (denseblock3 = 14x14 nét hơn, denseblock4 = 7x7)
+python scripts/dev/run_gradcam_batch.py --diseases Cardiomegaly,Effusion --target denseblock4
+```
+
+**Module tái sử dụng** (dùng lại cho FastAPI/Streamlit):
+- `src/dl/preprocess.py` — decode RLE mask, load ảnh xám, build tensor (đúng
+  pipeline lúc train: 224 → nhân lung mask → ImageNet normalize)
+- `src/dl/model.py` — build/load DenseNet121 từ checkpoint Stage-2
+- `src/dl/gradcam.py` — `GradCAM` class (forward/backward hook), colormap `jet`
+  thuần numpy, `overlay_heatmap` (chỉ giữ CAM trong vùng phổi)
+
+**Output** `data/outputs/gradcam/`:
+- `gradcam_<Disease>.png` — contact sheet top-K: `[ảnh gốc | mask phổi | Grad-CAM | overlay]`
+- `cam_<image>_<Disease>.png` — ảnh overlay đơn lẻ
+- `gradcam_index.csv` — (image_index, disease, prob, label, file)
+
+**Kết quả & nhận xét:**
+- Sinh được heatmap cho **13/14 bệnh** (Hernia không có ca dương tính trong test)
+- **Effusion** → CAM tập trung ở **đáy phổi**; **Emphysema** → **vùng phổi trên**
+  — khớp giải phẫu, cho thấy model học được tín hiệu vị trí dù mAU mới 0.63
+- **Cardiomegaly** → CAM không chỉ vào tim mà vào **phổi**: vì `MASK_MODE='lungs'`
+  **mask mất vùng tim** khỏi input, model chỉ còn thông tin hình dạng phổi để suy
+  ra tim to. Đây là luận cứ để thử `MASK_MODE='lungs_heart'` (đã hỗ trợ sẵn trong
+  notebook + `lung_mask(include_heart=True)`)
+- Ảnh portable/AP có cột chụp mờ → CAM đôi khi bám vào **biên ảnh/viền collimation**
+  thay vì phổi: hạn chế của model yếu (2k ảnh, 8 epoch) chứ không phải lỗi Grad-CAM
+- Lớp đích mặc định `denseblock3` (1024×14×14) cho heatmap nét gấp 4 lần so với
+  `denseblock4` (1024×7×7); không hook `model.features` vì DenseNet dùng
+  `F.relu(features, inplace=True)` làm autograd báo lỗi in-place trên output hook
+- Grad-CAM ở đây là **class-specific** trên 14 logit độc lập (multi-label, không
+  softmax) — mỗi bệnh có heatmap riêng, không phải CAM của lớp dự đoán cao nhất
 
 ## Ghi chú
 

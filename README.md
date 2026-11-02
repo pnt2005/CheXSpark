@@ -31,6 +31,7 @@ CheXSpark/
 ├── docker-compose.yml            # MinIO + PostgreSQL + Spark + MLflow + Airflow
 ├── .env.example                  # Biến môi trường (copy → .env trước khi chạy)
 ├── dags/                         # Airflow DAGs (Bronze→Silver→Gold)
+├── .github/workflows/            # kaggle-train.yml — bấm nút để train trên Kaggle GPU
 ├── infra/
 │   ├── postgres/init/            # SQL bootstrap (mlflow, chexspark_metadata, airflow)
 │   ├── airflow/Dockerfile        # Build image chexspark-airflow (PySpark + Spark provider + mlflow)
@@ -51,7 +52,8 @@ CheXSpark/
 │   └── kaggle/                   # stage1_unet_segmentation.ipynb (U-Net) + stage2_densenet121.ipynb
 ├── tests/                        # Unit & integration tests
 └── scripts/
-    └── dev/                      # extract_subset, export Silver→Kaggle, train/eval Stage-1, features, Grad-CAM, registry
+    ├── dev/                      # extract_subset, export Silver→Kaggle, train/eval Stage-1, features, Grad-CAM, registry
+    └── kaggle/                   # train_on_kaggle.py — push dataset+notebook, chờ train, tải output
 ```
 
 ## Cách chạy
@@ -439,6 +441,51 @@ python scripts/dev/run_gradcam_batch.py --from-registry --alias production
   `F.relu(features, inplace=True)` làm autograd báo lỗi in-place trên output hook
 - Grad-CAM ở đây là **class-specific** trên 14 logit độc lập (multi-label, không
   softmax) — mỗi bệnh có heatmap riêng, không phải CAM của lớp dự đoán cao nhất
+
+## Train trên Kaggle (GPU) — tự động hoá
+
+Máy local không có GPU nên train thật chạy trên **Kaggle T4 ×2**. Thay vì thao tác
+tay trên web, `scripts/kaggle/train_on_kaggle.py` gói cả vòng đời thành **1 lệnh**:
+
+```powershell
+# 0. Cài + xác thực (một lần). GPU cần xác thực số điện thoại trong Kaggle Settings.
+D:\BigData\venv-mlops\Scripts\python -m pip install kaggle
+D:\BigData\venv-mlops\Scripts\kaggle auth login          # hoặc tạo ~/.kaggle/kaggle.json
+
+# 1. Kiểm tra credential + cấu hình
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1 --check
+
+# 2. Xem trước những gì sẽ chạy (không gọi Kaggle)
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1 --dry-run
+
+# 3. Train + tải kết quả + đăng ký MLflow (Docker phải đang chạy)
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 1 --upload-dataset --register
+D:\BigData\venv-mlops\Scripts\python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 --mask-mode lungs_heart --register
+```
+
+Script làm 5 việc:
+
+1. Cập nhật dataset `chexspark-stage2-nih-dev` (nếu `--upload-dataset`) — dùng chung cho cả 2 stage
+2. Sinh `kernel-metadata.json` + **patch config trong notebook** (`IMG_ROOT`, `META_ROOT`,
+   `EPOCHS`, `BASE`, `BATCH_SIZE`, `LR`, `MASK_MODE`) vào `data/kaggle/kernels/stageN/`
+3. `kaggle kernels push` → Kaggle chạy notebook trên GPU (`enable_gpu: true`)
+4. Poll `kaggle kernels status` tới khi xong; nếu lỗi thì in 40 dòng log cuối
+5. `kaggle kernels output` → tải checkpoint + metrics, `--install` copy vào
+   `notebooks/kaggle/`, `--register` đăng ký version mới + alias `production`
+
+**Bấm nút trên GitHub** (`.github/workflows/kaggle-train.yml`): thêm 2 secrets
+`KAGGLE_USERNAME` / `KAGGLE_KEY` rồi **Actions → Train on Kaggle (GPU) → Run workflow**
+(chọn stage, epoch, có cập nhật dataset hay không) — checkpoint tải về làm artifact
+14 ngày, không cần bật máy local.
+
+**Ghi chú**
+- Dùng **Kaggle CLI** (subprocess) chứ không dùng SDK Python: SDK 2.x đã bỏ
+  `dataset_create_new`/`dataset_create_version`, còn subcommand CLI thì ổn định.
+- Notebook Kaggle tự chứa (không import `src/`), nên upload lên là chạy được; kiến
+  trúc model đã được kiểm tra khớp `state_dict` với `src/dl/*` → checkpoint dùng lẫn được.
+- `--check` dò username từ `KAGGLE_USERNAME` → `~/.kaggle/kaggle.json` → `kaggle config view`;
+  không dò được thì truyền `--username`.
+- `--no-wait` để push rồi thoát; `--accelerator NvidiaTeslaT4` ép loại GPU.
 
 ## Orchestration với Apache Airflow
 

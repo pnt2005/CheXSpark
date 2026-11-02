@@ -15,6 +15,9 @@ Xây dựng hệ thống phát hiện và trực quan hóa đa bệnh lý lồng
 | **spark-worker-1** | **chexspark-spark:3.5.1** | 8081 | Worker (cores/memory cấu hình qua `.env`) |
 | **spark-worker-2** | **chexspark-spark:3.5.1** | 8082 | Worker |
 | **mlflow** | ghcr.io/mlflow/mlflow | 5000 | Experiment tracking + model registry |
+| **airflow-init** | **chexspark-airflow:2.9.3** (build local) | — | `airflow db migrate` + tạo user admin (one-shot) |
+| **airflow-webserver** | **chexspark-airflow:2.9.3** | 8085 | Airflow UI |
+| **airflow-scheduler** | **chexspark-airflow:2.9.3** | — | Chạy task (LocalExecutor) + Spark driver |
 
 > **Lưu ý image**: `apache/spark` mặc định **không kèm S3A jars** (không đọc được MinIO) và **không có mlflow**.
 > Vì vậy ta build image riêng `chexspark-spark:3.5.1` từ `infra/spark/Dockerfile`, thêm
@@ -25,10 +28,12 @@ Xây dựng hệ thống phát hiện và trực quan hóa đa bệnh lý lồng
 
 ```
 CheXSpark/
-├── docker-compose.yml            # MinIO + PostgreSQL + Spark cluster + MLflow
+├── docker-compose.yml            # MinIO + PostgreSQL + Spark + MLflow + Airflow
 ├── .env.example                  # Biến môi trường (copy → .env trước khi chạy)
+├── dags/                         # Airflow DAGs (Bronze→Silver→Gold)
 ├── infra/
-│   ├── postgres/init/            # SQL bootstrap (tạo DB mlflow, chexspark_metadata)
+│   ├── postgres/init/            # SQL bootstrap (mlflow, chexspark_metadata, airflow)
+│   ├── airflow/Dockerfile        # Build image chexspark-airflow (PySpark + Spark provider)
 │   └── spark/
 │       ├── Dockerfile            # Build image chexspark-spark (S3A jars + mlflow)
 │       ├── jars/                 # hadoop-aws + aws-java-sdk-bundle (cho S3A/MinIO)
@@ -66,6 +71,7 @@ docker compose ps
 - **Spark Master UI**: http://localhost:8080
 - **Spark Worker UIs**: http://localhost:8081, http://localhost:8082
 - **MLflow UI**: http://localhost:5000
+- **Airflow UI**: http://localhost:8085 (`admin` / `admin` — chỉ dùng cho dev)
 
 ### Gửi một Spark job thử
 
@@ -354,6 +360,65 @@ python scripts/dev/run_gradcam_batch.py --diseases Cardiomegaly,Effusion --targe
   `F.relu(features, inplace=True)` làm autograd báo lỗi in-place trên output hook
 - Grad-CAM ở đây là **class-specific** trên 14 logit độc lập (multi-label, không
   softmax) — mỗi bệnh có heatmap riêng, không phải CAM của lớp dự đoán cao nhất
+
+## Orchestration với Apache Airflow
+
+Airflow điều phối toàn bộ pipeline Medallion: mỗi bước là một DAG riêng (chạy lại
+độc lập được khi lỗi), cộng một DAG tổng điều phối thứ tự.
+
+| DAG | Task | Việc |
+|---|---|---|
+| `chexspark_bronze_to_silver` | `ingest_bronze_to_silver` | 112k metadata → Silver `cxr14` (patient-level split) |
+| `chexspark_chexmask_join` | `ingest_chexmask_to_silver` | CheXmask RLE → Silver `cxr14_masked` (broadcast join) |
+| `chexspark_gold_analytics` | `disease_cooccurrence` → `disease_graph` → `verify_gold` | Gold: co-occurrence + mạng bệnh lý |
+| `chexspark_pipeline` | 3 × `TriggerDagRunOperator` | Chạy tuần tự 3 DAG trên và **chờ** từng cái xong |
+
+```powershell
+# Bật hạ tầng (lần đầu sẽ build image chexspark-airflow ~1GB do kèm PySpark)
+docker compose up -d --build
+
+# Xem DAG đã được parse
+docker compose exec airflow-scheduler airflow dags list
+
+# Chạy toàn pipeline (trigger thủ công)
+docker compose exec airflow-scheduler airflow dags trigger chexspark_pipeline
+
+# Hoặc chạy lẻ từng bước
+docker compose exec airflow-scheduler airflow dags trigger chexspark_gold_analytics
+
+# Xem trạng thái các run
+docker compose exec airflow-scheduler airflow dags list-runs -d chexspark_pipeline
+```
+
+UI: http://localhost:8085 (`admin`/`admin`), DAGs bật sẵn (`DAGS_ARE_PAUSED_AT_CREATION=false`).
+
+**Cách Airflow nộp job Spark** (`dags/spark_utils.py`):
+- `SparkSubmitOperator` gọi `spark-submit` (PySpark 3.5.1 cài trong image Airflow —
+  **khớp đúng** phiên bản cluster `chexspark-spark:3.5.1`)
+- **client mode**: driver chạy trong container `airflow-scheduler`, executor chạy
+  trên `spark-worker-1/2`; `spark.driver.host=airflow-scheduler` để executor kết
+  nối ngược lại driver qua mạng `chexspark-net`
+- **Python 3.8** ở cả hai phía: image Airflow dùng `apache/airflow:2.9.3-python3.8`
+  vì PySpark bắt buộc driver và worker **cùng minor version** (`apache/spark:3.5.1`
+  dùng Python 3.8.10). Lệch version sẽ báo `PYTHON_VERSION_MISMATCH`
+- S3A jars (`hadoop-aws`, `aws-java-sdk-bundle`) mount từ `infra/spark/jars` và nạp
+  **chỉ cho driver** qua `spark.driver.extraClassPath` — **không** dùng `--jars` vì
+  Spark sẽ đẩy thêm một bản jar xuống executor (executor đã có sẵn trong image),
+  nạp trùng làm commit file trên S3A hỏng (`No such file or directory` khi rename)
+- Cấu hình S3A/MinIO truyền qua `--conf` (driver không đọc `spark-defaults.conf`
+  của cluster); dùng `mapreduce.fileoutputcommitter.algorithm.version=2` để job
+  ghi lại nhiều lần vẫn ổn định
+- Credentials MinIO lấy từ env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) —
+  **không** hard-code trong DAG
+- `PYTHONPATH=/opt/airflow/src` để job import được `common.spark_session`
+
+**Giới hạn tài nguyên** (cluster dev 8GB): `AIRFLOW__CORE__PARALLELISM=1`,
+`DAG_CONCURRENCY=1`, driver `1g`, executor `1g`, `spark.cores.max=2` — tránh tranh
+RAM với 2 Spark worker.
+
+> **Lưu ý**: `chexspark_pipeline` chỉ chạy phần **data pipeline** (Bronze→Gold).
+> Train Stage-2 (DenseNet121) và Stage-3 (Grad-CAM) chạy trên Kaggle GPU / local
+> vì cần GPU, không đưa vào Airflow.
 
 ## Ghi chú
 

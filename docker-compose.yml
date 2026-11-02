@@ -11,6 +11,34 @@ x-minio-creds: &minio-creds
   AWS_S3_ENDPOINT: http://minio:9000
   AWS_PATH_STYLE_ACCESS: "true"
 
+# ─────────────────────────── Airflow (orchestration) ───────────────────────────
+x-airflow-env: &airflow-env
+  <<: *minio-creds
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-chexspark123}@postgres:5432/airflow
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+  # Cluster dev 8GB: 2 slot = 1 task điều phối (TriggerDagRunOperator đang chờ)
+  # + 1 task Spark thật. Để 1 sẽ DEADLOCK: task chờ chiếm hết slot nên DAG con
+  # không bao giờ được schedule.
+  AIRFLOW__CORE__PARALLELISM: "2"
+  AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "2"
+  AIRFLOW__CORE__DAG_CONCURRENCY: "1"
+  AIRFLOW__WEBSERVER__WORKERS: "1"
+  AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+  # SparkSubmitOperator lấy --master từ connection này (provider 4.8.x)
+  AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master:7077"}'
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  SPARK_MASTER_URL: spark://spark-master:7077
+
+x-airflow-volumes: &airflow-volumes
+  - ./dags:/opt/airflow/dags
+  - ./src:/opt/airflow/src:ro          # Spark job scripts (nộp qua spark-submit)
+  - ./infra/spark/jars:/opt/airflow/jars:ro   # S3A jars cho driver
+  - airflow-logs:/opt/airflow/logs
+
+
 services:
   # ─────────────────────────── MinIO (S3-compatible object storage) ───────────────────────────
   minio:
@@ -206,6 +234,70 @@ services:
     networks: [chexspark-net]
     restart: unless-stopped
 
+  # ─────────────────────────── Apache Airflow — init (DB migrate + admin user) ───────────────────────────
+  airflow-init:
+    build: ./infra/airflow
+    image: chexspark-airflow:2.9.3
+    container_name: chexspark-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-env
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname Admin --lastname CheXSpark --role Admin \
+          --email admin@chexspark.local || true
+        echo "Airflow DB ready"
+    networks: [chexspark-net]
+    restart: "no"
+
+  # ─────────────────────────── Apache Airflow — webserver (UI) ───────────────────────────
+  airflow-webserver:
+    image: chexspark-airflow:2.9.3
+    container_name: chexspark-airflow-webserver
+    hostname: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-env
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8085}:8080"
+    volumes: *airflow-volumes
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [chexspark-net]
+    restart: unless-stopped
+
+  # ─────────────────────────── Apache Airflow — scheduler (chạy task + Spark driver) ───────────────────────────
+  airflow-scheduler:
+    image: chexspark-airflow:2.9.3
+    container_name: chexspark-airflow-scheduler
+    hostname: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-env
+    command: scheduler
+    volumes: *airflow-volumes
+    networks:
+      chexspark-net:
+        aliases:
+          - airflow-scheduler
+    restart: unless-stopped
+
 networks:
   chexspark-net:
     driver: bridge
@@ -214,3 +306,4 @@ volumes:
   minio-data:
   postgres-data:
   spark-warehouse:
+  airflow-logs:

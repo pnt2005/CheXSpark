@@ -631,6 +631,8 @@ sang nên không mất kết quả tốt nhất. Local cũng resume được:
 - `--mask-input none` bỏ hẳn mask (đối chứng); `masked` = cách cũ `ảnh*phổi`;
   `3ch` (mặc định) = `[ảnh, ảnh*phổi, ảnh*(phổi∪tim)]`.
 - `--no-aug` / `--no-tta` / `--no-calibrate` để chạy ablation.
+- `--wait-only` để **không push lại**: chỉ poll kernel đang chạy trên Kaggle rồi tải
+  output + đăng ký — dùng khi phiên chờ bị gián đoạn (máy restart) mà run vẫn sống.
 
 ### 6b. Cải tiến thuật toán Stage-2 (v1.1)
 
@@ -673,11 +675,59 @@ trên test 344 ảnh — chỉ mang giá trị **định hướng** vì tập te
 - **Gói v1.1 (3ch + aug + TTA) hơn cách cũ +0.0188** (0.6873 vs 0.6685).
 - Val của ba run gần như giống nhau (0.704–0.710) trong khi test dao động
   0.638–0.687 → đúng dự đoán: với 321 val / 344 test, con số chỉ để so sánh
-  **xu hướng**, không phải hiệu năng tuyệt đối — số liệu chốt phải là run 112k.
+  **xu hướng**, không phải hiệu năng tuyệt đối — số liệu chốt là run 112k (**mục 6c**,
+  test 0.8331).
 
 Notebook ghi `calibration.temperature` và `calibration.threshold` (mỗi nhãn) vào
 `stage2_metrics.json`; serving (FastAPI/Streamlit) đọc lại để biến logit thành xác suất
 đã hiệu chỉnh thay vì dùng sigmoid thô.
+
+### 6c. Kết quả train full 112k → model production
+
+Chạy **lệnh 6** ở mục *Train trên Kaggle*: 30 epoch trên T4, ~450 s/epoch ≈ **3,9 giờ**,
+dữ liệu 112.120 ảnh / 30.805 bệnh nhân (train 77.728 / val 17.662 / test 16.730),
+mask pack **thiếu 0/112.120**, `mask_input=3ch + aug + TTA + calibration`.
+
+| Chỉ số | Dev 2k (test 344 ảnh) | **Full 112k (test 16.730 ảnh)** |
+|---|---|---|
+| val mAUROC | 0.7052 | 0.8196 |
+| **test mAUROC** | 0.6873 | **0.8331** |
+
+- **Best val ở epoch 5** (0.8168); loss train tiếp tục tụt 0.82 → 0.20 trong khi val
+  rơi về 0.776 ở epoch 30 → **overfit sau epoch ~5**, 30 epoch là dư — lần sau rút
+  còn 10–15 epoch (hoặc tăng weight decay / dropout) sẽ tiết kiệm ~2/3 GPU.
+- Test 0.8331 xấp xỉ mức CheXNet báo cáo trên ChestX-ray14 (0.8414) — **có caveat**:
+  split của ta là patient-level 112k/16.730 ảnh, không phải split 24.429 ảnh chính
+  thức của NIH nên chỉ so sánh được mặt ý nghĩa, không phải bảng so sánh trực tiếp.
+
+Từng nhãn trên test (đã TTA + hiệu chỉnh temperature + ngưỡng Youden trên val):
+
+| Nhãn | AUC | Ngưỡng | Sens | Spec |
+|---|---|---|---|---|
+| Hernia | 0.929 | 0,07 | 0,652 | 0,988 |
+| Emphysema | 0,906 | 0,37 | 0,789 | 0,868 |
+| Edema | 0,905 | 0,19 | 0,866 | 0,792 |
+| Cardiomegaly | 0,893 | 0,26 | 0,789 | 0,830 |
+| Effusion | 0,881 | 0,50 | 0,827 | 0,778 |
+| Pneumothorax | 0,877 | 0,49 | 0,797 | 0,820 |
+| Mass | 0,839 | 0,38 | 0,701 | 0,821 |
+| Atelectasis | 0,811 | 0,50 | 0,776 | 0,690 |
+| Pleural_Thickening | 0,801 | 0,22 | 0,741 | 0,705 |
+| Consolidation | 0,789 | 0,45 | 0,766 | 0,674 |
+| Fibrosis | 0,785 | 0,05 | 0,676 | 0,730 |
+| Pneumonia | 0,774 | 0,05 | 0,634 | 0,760 |
+| Nodule | 0,764 | 0,39 | 0,637 | 0,747 |
+| Infiltration | 0,710 | 0,52 | 0,552 | 0,754 |
+| **mean** | **0,833** | | | |
+
+- **Đăng ký**: `chexspark-stage2-densenet121` **version 3, alias `production`**
+  (MLflow run `3dd0f14b7a044dd9aa04ad25ad17bd34`) — model này là model được
+  FastAPI/Streamlit phục vụ.
+- Output tải về `data/kaggle/output/stage2-112k/` (`best_*.pth` 27 MB, `last_*.pth`
+  82 MB, `stage2_densenet121_final.pth`, `stage2_metrics.json`) và cài vào
+  `notebooks/kaggle/`.
+- Nếu phiên chờ bị gián đoạn (máy restart) mà kernel vẫn chạy trên Kaggle: chạy lại
+  với **`--wait-only`** — chỉ poll kernel đang chạy rồi tải + đăng ký, không push lại.
 
 ## Orchestration với Apache Airflow
 

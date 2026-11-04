@@ -35,6 +35,12 @@ Usage:
         --no-aug --no-tta --mask-input masked
     python scripts/kaggle/train_on_kaggle.py --stage 2 --mask-input none --no-aug
 
+    # Train Stage-1 full 112k (GT từ mask pack, không decode RLE) + đăng ký MLflow
+    python scripts/kaggle/train_on_kaggle.py --stage 1 \
+        --dataset-slug chexspark-stage2-nih-112k \
+        --masks-dataset pnt2005/chexspark-masks-224-112k \
+        --epochs 12 --batch-size 32 --install --register
+
     # Kaggle cắt session 12h -> chạy tiếp từ checkpoint của lần trước
     python scripts/kaggle/train_on_kaggle.py --stage 2 --epochs 30 \\
         --resume-from pnt2005/chexspark-stage2-densenet121
@@ -522,15 +528,19 @@ def main() -> None:
         if "/" not in resume_ref:
             resume_ref = f"{username}/{resume_ref}"
 
-    # Mask precompute chỉ có ý nghĩa với Stage-2 (Stage-1 decode RLE làm GT).
+    # Mask precompute: stage-2 dùng làm input (mask_mode != none), stage-1 dùng làm
+    # GT (thay decode RLE — bắt buộc khi train full 112k vì CSV 112k không kèm RLE).
     # Chỉ bật khi người dùng chủ động chọn (dataset phải tồn tại trên Kaggle rồi),
     # tránh push fail vì thiếu dataset ở lần chạy đầu.
     masks_ref = None
-    if args.stage == 2 and (args.masks_dataset or args.upload_masks):
+    if args.masks_dataset or args.upload_masks:
         masks_ref = args.masks_dataset or f"{username}/{DEFAULT_MASKS_SLUG}"
     if args.stage == 2 and not masks_ref and args.mask_mode != "none":
         print("[WARN] Không dùng mask precompute -> notebook decode RLE mỗi epoch "
               "(~8-12 ms/ảnh). Thêm --upload-masks (lần đầu) hoặc --masks-dataset.")
+    if args.stage == 1 and not masks_ref:
+        print("[INFO] Stage-1 không có --masks-dataset -> GT decode từ RLE "
+              "(chỉ phù hợp dev subset; train 112k cần mask pack GT).")
 
     overrides = {
         "epochs": args.epochs, "base": args.base, "batch_size": args.batch_size,

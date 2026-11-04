@@ -24,10 +24,16 @@ USER airflow
 # PySpark 3.5.1 = đúng phiên bản cluster (chexspark-spark:3.5.1) để tránh lệch protocol.
 # mlflow 2.9.2: driver Spark chạy TRONG container này (client deploy mode) nên cần
 # mlflow để log run — thiếu nó job vẫn "thành công" nhưng bỏ qua toàn bộ tracking.
+# kaggle==1.7.4.5: CLI để DAG retrain push train Stage-2 (train_on_kaggle.py gọi
+#   qua subprocess, không import SDK). Python 3.8 nên 1.7.4.5 là bản mới nhất còn
+#   hỗ trợ (2.x yêu cầu >=3.9); đã kiểm tra đủ subcommand/flag cần dùng:
+#   datasets create/version/status (--dir-mode), kernels push/output/status
+#   (--timeout, --force). Credential lấy từ env KAGGLE_USERNAME/KAGGLE_KEY (compose).
 RUN pip install --no-cache-dir \
         "pyspark==3.5.1" \
         "apache-airflow-providers-apache-spark==4.8.1" \
-        "mlflow==2.9.2"
+        "mlflow==2.9.2" \
+        "kaggle==1.7.4.5"
 
 # spark-submit được pip đặt trong ~/.local/bin
 # LƯU Ý: KHÔNG set PYSPARK_PYTHON — biến này bị Spark lan sang executor

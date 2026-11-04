@@ -31,11 +31,19 @@ x-airflow-env: &airflow-env
   AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master:7077"}'
   MLFLOW_TRACKING_URI: http://mlflow:5000
   SPARK_MASTER_URL: spark://spark-master:7077
+  # Kaggle CLI trong DAG retrain (train_on_kaggle.py nạp .env nếu có, ở container
+  # không có .env nên lấy từ env này — cùng giá trị với .env trên host)
+  KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
+  KAGGLE_KEY: ${KAGGLE_KEY:-}
 
 x-airflow-volumes: &airflow-volumes
   - ./dags:/opt/airflow/dags
   - ./src:/opt/airflow/src:ro          # Spark job scripts (nộp qua spark-submit)
   - ./infra/spark/jars:/opt/airflow/jars:ro   # S3A jars cho driver
+  # Cho DAG chexspark_retrain_112k: script export/Kaggle + chỗ ghi dataset & output
+  - ./scripts:/opt/airflow/scripts:ro
+  - ./data:/opt/airflow/data           # dataset Kaggle (labels/mask pack) + output train
+  - ./notebooks:/opt/airflow/notebooks # --install copy checkpoint/metrics vào đây
   - airflow-logs:/opt/airflow/logs
 
 

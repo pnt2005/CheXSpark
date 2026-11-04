@@ -576,6 +576,10 @@ def main() -> None:
                                          no_wait=args.no_wait)
 
     out_dir = args.output_dir or (ROOT / "data/kaggle/output" / f"stage{args.stage}")
+    if status == "queued":
+        # --no-wait: đã push và chủ động không chờ -> thoát mã 0 để task
+        # orchestration coi là xong; khâu chờ/tải/đăng ký do task khác (--wait-only).
+        return
     if status != "complete":
         # Kaggle vẫn lưu output của lần chạy lỗi/timeout -> tải về để resume
         print(f"\nKernel kết thúc với trạng thái '{status}'. Thử tải output giữa chừng ...")

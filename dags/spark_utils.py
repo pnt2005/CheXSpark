@@ -72,7 +72,8 @@ def spark_conf(driver_memory: str = "1g", executor_memory: str = "1g") -> dict[s
     }
 
 
-def spark_job(task_id: str, script: str, **kwargs) -> SparkSubmitOperator:
+def spark_job(task_id: str, script: str, *,
+              extra_conf: dict[str, str] | None = None, **kwargs) -> SparkSubmitOperator:
     """Tạo SparkSubmitOperator cho một script trong src/.
 
     Master KHÔNG truyền trực tiếp: SparkSubmitOperator (provider 4.8.x) lấy
@@ -82,14 +83,19 @@ def spark_job(task_id: str, script: str, **kwargs) -> SparkSubmitOperator:
     Args:
         task_id: ID task trong DAG
         script: đường dẫn tương đối trong src/ (vd "gold/disease_graph.py")
+        extra_conf: conf ghi đè/thêm cho job này (vd maxPartitionBytes để
+            tách file Bronze 2GB thành nhiều partition)
     """
+    conf = spark_conf()
+    if extra_conf:
+        conf.update(extra_conf)
     return SparkSubmitOperator(
         task_id=task_id,
         application=f"{APP_DIR}/{script}",
         conn_id="spark_default",
         name=f"chexspark-{task_id}",
         deploy_mode="client",
-        conf=spark_conf(),
+        conf=conf,
         env_vars={"PYTHONPATH": APP_DIR},
         verbose=True,
         **kwargs,

@@ -740,6 +740,7 @@ Airflow điều phối toàn bộ pipeline Medallion: mỗi bước là một DA
 | `chexspark_chexmask_join` | `ingest_chexmask_to_silver` → `precompute_masks_224` | CheXmask RLE → Silver `cxr14_masked` (broadcast join) → mask 224 packed+PNG |
 | `chexspark_gold_analytics` | `disease_cooccurrence` → `disease_graph` → `verify_gold` | Gold: co-occurrence + mạng bệnh lý |
 | `chexspark_pipeline` | 3 × `TriggerDagRunOperator` | Chạy tuần tự 3 DAG trên và **chờ** từng cái xong |
+| `chexspark_retrain_112k` | 7 task xếp dọc (Spark → export → Kaggle → MLflow) | **Vòng retrain 112k**: chuẩn bị dữ liệu, train trên Kaggle GPU, đăng ký `production` |
 
 ```powershell
 # Bật hạ tầng (lần đầu sẽ build image chexspark-airflow ~1GB do kèm PySpark)
@@ -786,7 +787,52 @@ RAM với 2 Spark worker.
 
 > **Lưu ý**: `chexspark_pipeline` chỉ chạy phần **data pipeline** (Bronze→Gold).
 > Train Stage-2 (DenseNet121) và Stage-3 (Grad-CAM) chạy trên Kaggle GPU / local
-> vì cần GPU, không đưa vào Airflow.
+> vì cần GPU. Riêng DAG `chexspark_retrain_112k` dưới đây **đẩy** job train lên
+> Kaggle GPU rồi Airflow chờ xong và tự đăng ký model.
+
+### DAG retrain 112k (`chexspark_retrain_112k`)
+
+Vòng lặp MLOps chạy **một lệnh** thay cho các bước tay ở mục 5c + mục Train trên
+Kaggle. **Trigger thủ công** (`schedule=None`) vì mỗi lần đầy đủ tốn ~4 GPU-giờ.
+Không đụng bản dev 2k: ghi `silver/cxr14_full`, `silver/cxr14_masks_full`, dataset
+Kaggle `chexspark-stage2-nih-112k` / `chexspark-masks-224-112k`.
+
+| # | Task | Việc | Timeout |
+|---|---|---|---|
+| 1 | `ingest_silver_full` | Bronze → Silver full 112k (`ingest_bronze_to_silver.py --full`) | 45' |
+| 2 | `precompute_masks_full` | Mask 224 packed từ Bronze CheXmask (`precompute_masks.py --source bronze`) | 90' |
+| 3 | `stage_parquet_local` | Stage Parquet từ MinIO về `data/tmp/retrain_stage` (boto3) | 45' |
+| 4 | `export_kaggle_datasets` | Export labels CSV + mask pack `.npy` vào `data/kaggle/*` | 120' |
+| 5 | `push_training` | Upload 2 dataset + push kernel `--no-wait` | 3' |
+| 6 | `wait_and_register` | Chờ kernel xong → tải output → đăng ký MLflow | 14' |
+| 7 | `verify_production` | Xác nhận alias `production` trỏ version mới | 15' |
+
+**Chạy thử không tốn GPU/quota** (`push_training=false` → task 5–7 in `[skip]`,
+chỉ chạy 4 task dữ liệu, ~7 phút):
+
+```powershell
+# PowerShell cắt mất dấu " trong JSON --conf → ghi ra file rồi docker cp
+Set-Content -Path $env:TEMP\retrain_conf.json -Value '{"push_training":false}' -NoNewline
+docker cp $env:TEMP\retrain_conf.json chexspark-airflow-scheduler:/tmp/retrain_conf.json
+docker exec chexspark-airflow-scheduler sh -c 'airflow dags trigger chexspark_retrain_112k --conf $(cat /tmp/retrain_conf.json)'
+
+# Xem trạng thái (task 1–4 success, 5–7 success với log [skip])
+docker exec chexspark-airflow-scheduler airflow dags list-runs -d chexspark_retrain_112k --no-backfill
+docker exec chexspark-airflow-scheduler airflow tasks states-for-dag-run chexspark_retrain_112k <run_id>
+```
+
+**Chạy đầy đủ** (train 30 epoch trên T4 ~4h rồi tự đăng ký `production`): trigger
+không cần `--conf` (param `push_training` mặc định `True`), hoặc bấm nút **Trigger
+DAG** trên UI http://localhost:8085 và bật toggle `push_training`.
+
+**Chống chạy trùng & khôi phục sau gián đoạn**:
+- Task 5 `retries=0` **cố ý**: push lại sẽ khởi động lần train thứ hai trên GPU →
+  không retry, chỉ chạy tay sau khi xác nhận kernel cũ đã dừng.
+- Task 6 `--wait-only` **chạy lại được**: poll kernel đang chạy rồi tải + đăng ký,
+  không push lại. Nếu run rơi khi đang chờ thì **clear riêng task 6** rồi chạy tiếp.
+- Task 3 stage vào `data/tmp/retrain_stage` do chính task tạo (thuộc uid airflow);
+  không dùng `data/tmp/silver_full` cũ (755 thuộc uid khác → `PermissionError` khi
+  xóa lần chạy trước).
 
 ## MLOps: MLflow Model Registry
 

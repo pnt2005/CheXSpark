@@ -54,3 +54,43 @@ def build_tensor(gray: np.ndarray, mask: np.ndarray | None = None) -> torch.Tens
     arr = gray * mask if mask is not None else gray
     x = np.stack([arr] * 3, axis=0)
     return NORM(torch.from_numpy(x)).unsqueeze(0)
+
+
+def build_input(
+    gray: np.ndarray,
+    lung: np.ndarray | None = None,
+    heart: np.ndarray | None = None,
+    mask_input: str = "3ch",
+) -> torch.Tensor:
+    """Ghép ảnh + mask thành input Stage-2 — **khớp tuyệt đối** notebook train.
+
+    Ba chế độ (xem `CheXSparkDataset.__getitem__` trong notebook Kaggle):
+
+        3ch    ch0 = ảnh gốc (giữ trung thất/tim), ch1 = ảnh×phổi,
+               ch2 = ảnh×(phổi∪ tim)   ← cấu hình của model production
+        masked ch0=ch1=ch2 = ảnh×phổi   (cách cũ, hại Cardiomegaly)
+        none   ch0=ch1=ch2 = ảnh gốc    (không mask)
+
+    Args:
+        gray: ảnh xám float32 [0,1] cỡ IMG_SIZE
+        lung: mask phổi 0/1 cùng cỡ (U-Net Stage-1 khi suy luận)
+        heart: mask tim 0/1 cùng cỡ (CheXmask khi train; proxy khi suy luận)
+        mask_input: "3ch" | "masked" | "none" (lấy từ metrics config)
+    """
+    g = torch.from_numpy(np.ascontiguousarray(gray, dtype=np.float32))[None]  # (1,H,W)
+
+    if mask_input == "none" or lung is None:
+        x = torch.cat([g] * 3, dim=0)
+    elif mask_input == "masked":
+        lm = torch.from_numpy(np.asarray(lung, dtype=np.float32))[None]
+        x = torch.cat([g * lm] * 3, dim=0)
+    else:  # "3ch"
+        lm = torch.from_numpy(np.asarray(lung, dtype=np.float32))[None]
+        hm = (
+            torch.from_numpy(np.asarray(heart, dtype=np.float32))[None]
+            if heart is not None
+            else torch.zeros_like(lm)
+        )
+        x = torch.cat([g, g * lm, g * torch.clamp(lm + hm, 0, 1)], dim=0)
+
+    return NORM(x).unsqueeze(0)

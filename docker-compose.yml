@@ -313,6 +313,73 @@ services:
           - airflow-scheduler
     restart: unless-stopped
 
+  # ─────────────────────────── Serving (FastAPI + Streamlit) ────────────────────────
+  # Image chung cho 2 service: inference 3 giai đoạn (U-Net → DenseNet121 → Grad-CAM),
+  # model đọc từ MLflow registry theo alias, fallback .pth trong notebooks/kaggle.
+  fastapi-app:
+    build:
+      context: .
+      dockerfile: infra/serving/Dockerfile
+    image: chexspark-serving:1.0
+    container_name: chexspark-fastapi
+    depends_on:
+      minio:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+    environment:
+      <<: *minio-creds
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      GOLD_S3_ENDPOINT: http://minio:9000
+      # gold_store KHÔNG đọc AWS_* (máy dev có AWS key thật) → truyền riêng
+      GOLD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-chexspark}
+      GOLD_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-chexspark123}
+      SERVING_DEVICE: cpu
+      # SERVING_USE_REGISTRY=0 → bỏ qua MLflow, load thẳng .pth (chạy offline)
+      SERVING_USE_REGISTRY: ${SERVING_USE_REGISTRY:-1}
+    command: uvicorn serving.api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "${SERVING_PORT:-8000}:8000"
+    volumes:
+      - ./src:/app/src:ro              # chỉnh code không cần rebuild image
+      - ./notebooks:/app/notebooks:ro  # checkpoint fallback khi MLflow chưa chạy
+    healthcheck:
+      # urllib (có sẵn) thay curl — image slim không kèm curl
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8000/api/v1/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [chexspark-net]
+    restart: unless-stopped
+
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: infra/serving/Dockerfile
+    image: chexspark-serving:1.0
+    container_name: chexspark-streamlit
+    depends_on:
+      fastapi-app:
+        condition: service_healthy
+    environment:
+      API_BASE: http://fastapi-app:8000
+    command: >
+      streamlit run src/serving/streamlit_app.py
+      --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    volumes:
+      - ./src:/app/src:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://localhost:8501/_stcore/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks: [chexspark-net]
+    restart: unless-stopped
+
 networks:
   chexspark-net:
     driver: bridge

@@ -36,6 +36,7 @@ CheXSpark/
 │   ├── postgres/init/            # SQL bootstrap (mlflow, chexspark_metadata, airflow)
 │   ├── airflow/Dockerfile        # Build image chexspark-airflow (PySpark + Spark provider + mlflow)
 │   ├── mlflow/Dockerfile         # Image MLflow + psycopg2 (Postgres) + boto3 (MinIO)
+│   ├── serving/Dockerfile        # Image chexspark-serving (torch CPU + FastAPI + Streamlit)
 │   └── spark/
 │       ├── Dockerfile            # Build image chexspark-spark (S3A jars + mlflow)
 │       ├── jars/                 # hadoop-aws + aws-java-sdk-bundle (cho S3A/MinIO)
@@ -45,14 +46,14 @@ CheXSpark/
 │   ├── ingestion/                # Spark Core: Bronze → Silver (ingest, mask join, verify)
 │   ├── silver/                   # precompute_masks.py — decode RLE 1 lần → mask 224 (bits+PNG)
 │   ├── gold/                     # co-occurrence, disease network, MLlib PCA/K-Means/LR/RF
-│   ├── dl/                       # U-Net (Stage-1), DenseNet121 + Grad-CAM (Stage-2/3), preprocess
+│   ├── dl/                       # U-Net (Stage-1), DenseNet121 + Grad-CAM (Stage-2/3), preprocess (build_input)
 │   ├── mlops/                    # MLflow Model Registry (register/promote/load theo alias)
-│   └── serving/                  # FastAPI inference + Streamlit UI
+│   └── serving/                  # api.py (FastAPI), pipeline.py (InferenceEngine), streamlit_app.py, gold_store.py
 ├── notebooks/
 │   └── kaggle/                   # stage1_unet_segmentation.ipynb (U-Net) + stage2_densenet121.ipynb
-├── tests/                        # Unit & integration tests
+├── tests/                        # Unit & integration tests (test_serving.py — contract train/serving)
 └── scripts/
-    ├── dev/                      # extract_subset, export Silver→Kaggle, export mask pack, train/eval Stage-1, features, Grad-CAM, registry
+    ├── dev/                      # extract_subset, export Silver→Kaggle, export mask pack, train/eval Stage-1, features, Grad-CAM, registry, benchmark_serving_mask
     └── kaggle/                   # train_on_kaggle.py — push dataset+notebook, chờ train, resume, tải output
 ```
 
@@ -76,6 +77,8 @@ docker compose ps
 - **Spark Worker UIs**: http://localhost:8081, http://localhost:8082
 - **MLflow UI**: http://localhost:5000
 - **Airflow UI**: http://localhost:8085 (`admin` / `admin` — chỉ dùng cho dev)
+- **FastAPI (serving)**: http://localhost:8000/docs
+- **Streamlit (dashboard)**: http://localhost:8501
 
 ### Gửi một Spark job thử
 
@@ -913,6 +916,145 @@ nằm trong `[0.057, 0.687]`.
 - Train Stage-2 chạy trên GPU Kaggle nên **đăng ký model là bước riêng** (thủ công
   hoặc CI) sau khi tải checkpoint về, không nằm trong DAG Spark — DAG chỉ lo dữ
   liệu Bronze→Gold.
+
+## Serving: FastAPI + Streamlit
+
+Hệ thống suy luận 3 giai đoạn đóng gói thành 2 service dùng chung một image
+`chexspark-serving:1.0` (`infra/serving/Dockerfile` — torch CPU, không cần GPU):
+
+| Service | Port | Việc |
+|---|---|---|
+| `fastapi-app` | 8000 | REST API: `POST /predict` + analytics đọc Gold layer |
+| `streamlit-app` | 8501 | Dashboard cho bác sĩ — gọi API, **không** tự chạy model |
+
+### Pipeline suy luận (khớp đúng lúc train)
+
+```
+ảnh CXR ──► [U-Net Stage-1] ──► mask phổi ──► build_input (3 kênh) ──► [DenseNet121] ──► 14 xác suất
+                                        └──────────────────────────────► [Grad-CAM] ──► heatmap
+```
+
+- Input 3 kênh sinh bởi `dl.preprocess.build_input` — **sao chép đúng**
+  `CheXSparkDataset.__getitem__` trong notebook Kaggle: `ch0` = ảnh gốc (giữ trung
+  thất/tim), `ch1` = ảnh×phổi, `ch2` = ảnh×(phổi∪ tim); mode lấy từ
+  `stage2_metrics.json` (`mask_input`, `mask_mode`) nên serving tự khớp cấu hình
+  của model đang serve.
+- **Không có CheXmask lúc suy luận** → vùng tim ước lượng bằng
+  `heart_mode=scanline` (lấp ngang mỗi hàng giữa hai phổi; `closing`/`none` để so
+  sánh) — xem đo đạc bên dưới.
+- **Calibration**: `sigmoid(logit / T)` với temperature per-label + ngưỡng Youden
+  per-label lấy từ `stage2_metrics.json` (fit trên val lúc train) — không dùng 0.5 cứng.
+- Model lấy từ **MLflow registry theo alias** `models:/…@production`; nếu MLflow
+  tắt thì fallback `.pth` trong `notebooks/kaggle/` (`SERVING_USE_REGISTRY=0`
+  để buộc bỏ qua registry).
+
+### Đo chênh lệch mask suy luận so với mask train
+
+`scripts/dev/benchmark_serving_mask.py` chạy đối chứng trên **dev test 344 ảnh**
+(cùng model, cùng calibration):
+
+| Đường suy luận | mAUROC | Δ so với train |
+|---|---|---|
+| `chexmask` — mask thật (đường train) | **0.8030** | — |
+| `scanline` — U-Net + tim ước lượng (mặc định serving) | **0.7923** | **−0,0107** |
+| `none` — U-Net, không ước lượng tim | 0.7920 | −0,0110 |
+| `closing` — U-Net + đóng morphology | 0.7915 | −0,0115 |
+
+Dice U-Net vs CheXmask trên chính 344 ảnh: **0,9461**. Với `scanline`, Cardiomegaly
+(0,9309) và Edema (0,9532) còn **cao hơn** đường tham chiếu — mất tập trung ở
+Effusion/Fibrosis. Kết quả chi tiết từng nhãn: `data/outputs/serving_mask_benchmark.json`.
+
+```powershell
+python scripts/dev/benchmark_serving_mask.py            # full 344, ~4 phút CPU
+python scripts/dev/benchmark_serving_mask.py --limit 64 # thử nhanh
+```
+
+### Chạy
+
+```powershell
+# Khởi động 2 service (image build ~1GB lần đầu — torch CPU + streamlit)
+docker compose up -d --build fastapi-app streamlit-app
+
+# Dashboard:  http://localhost:8501
+# API docs:   http://localhost:8000/docs   (OpenAPI tự sinh)
+docker compose logs -f fastapi-app
+```
+
+Chạy trên host khi đang dev (không cần build image):
+
+```powershell
+$env:PYTHONPATH = "src"
+$env:MLFLOW_TRACKING_URI = "http://localhost:5000"
+$env:GOLD_S3_ENDPOINT = "http://localhost:9000"   # gold_store không đọc AWS_* của máy
+uvicorn serving.api:app --port 8010
+```
+
+### Endpoints
+
+| Method | Path | Việc |
+|---|---|---|
+| GET | `/api/v1/health` | trạng thái model + Gold layer (503 tới khi model nạp xong) |
+| GET | `/api/v1/model` | nguồn model, calibration, toàn bộ version trong registry |
+| POST | `/api/v1/predict` | upload ảnh → findings + mask + heatmap (base64 PNG) |
+| GET | `/api/v1/analytics/disease-distribution` | phân bố 14 bệnh + phân bố số bệnh/ảnh |
+| GET | `/api/v1/analytics/top-pairs` | top cặp đồng xuất hiện |
+| GET | `/api/v1/graph/co-occurrence` | nodes + edges + summary mạng GraphX |
+| GET | `/api/v1/diseases` | danh sách 14 bệnh |
+
+```powershell
+# Ví dụ gọi predict (curl.exe có sẵn trên Windows)
+curl.exe -F "file=@data\bronze\images\00000004_000.png" `
+        "http://localhost:8000/api/v1/predict?gradcam=true"
+
+# Chỉ lấy xác suất (bỏ qua Grad-CAM, nhanh hơn ~300ms)
+curl.exe -F "file=@data\bronze\images\00000004_000.png" `
+        "http://localhost:8000/api/v1/predict?gradcam=false"
+
+# Vẽ Grad-CAM cho bệnh cụ thể
+curl.exe -F "file=@data\bronze\images\00000004_000.png" `
+        "http://localhost:8000/api/v1/predict?disease=Pneumonia"
+```
+
+Response (`/predict`):
+
+```json
+{
+  "findings": [
+    {"disease_name": "Cardiomegaly", "probability": 0.412, "threshold": 0.26, "is_positive": true}
+  ],
+  "top_disease": "Cardiomegaly",
+  "gradcam_disease": "Cardiomegaly",
+  "mask_coverage": 0.318,
+  "images": {"original": "<base64 PNG>", "mask": "...", "masked": "...", "heatmap": "..."},
+  "timings_ms": {"preprocess": 4.2, "segmentation": 35.1, "classification": 96.5, "gradcam": 210.3, "total": 346.1},
+  "model": {"stage2": {"source": "registry", "uri": "models:/chexspark-stage2-densenet121@production"}, "...": "..."}
+}
+```
+
+### Biến môi trường
+
+| Biến | Mặc định | Việc |
+|---|---|---|
+| `SERVING_PORT` / `STREAMLIT_PORT` | 8000 / 8501 | port publish trên host |
+| `API_BASE` | `http://localhost:8000` | Streamlit trỏ tới API nào |
+| `SERVING_USE_REGISTRY` | `1` | `0` → load `.pth` local, không cần MLflow |
+| `SERVING_HEART_MODE` | `scanline` | cách ước lượng tim: `scanline`/`closing`/`none` |
+| `SERVING_DEVICE` | `cpu` | `cuda` nếu có GPU |
+| `SERVING_CALIBRATION` | `notebooks/kaggle/stage2_metrics.json` | temperature + ngưỡng |
+| `SERVING_MAX_UPLOAD_MB` | 25 | giới hạn dung lượng ảnh upload |
+| `GOLD_S3_ENDPOINT` | `http://minio:9000` (host: `http://localhost:9000`) | đọc Gold layer |
+| `GOLD_ACCESS_KEY_ID` / `GOLD_SECRET_KEY` | `chexspark` / `chexspark123` | credential MinIO |
+
+**Lưu ý**
+- Endpoint analytics trả **503** kèm hướng dẫn khi bucket `gold` chưa có dữ liệu
+  → chạy DAG `chexspark_gold_analytics` trước (xem mục 7 — Gold layer).
+- `gold_store` **chỉ** đọc `GOLD_*`/`MINIO_*`, không đọc `AWS_*`: máy dev có
+  `AWS_ACCESS_KEY_ID` của dự án khác thì boto3 sẽ gửi key đó lên MinIO và bị
+  `InvalidAccessKeyId`.
+- Healthcheck của container dùng `/api/v1/health` → container báo *unhealthy*
+  cho tới khi model nạp xong (~10-30s lần đầu vì tải artifact từ MinIO).
+- Model được giữ trong RAM + mọi lần suy luận đi qua **một lock** nên API an toàn
+  khi Streamlit gọi song song; `/predict` chạy trong threadpool để không chặn event loop.
 
 ## Ghi chú
 

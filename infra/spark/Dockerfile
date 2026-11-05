@@ -20,4 +20,11 @@ RUN curl -fsSL -o /opt/spark/jars/hadoop-aws-3.3.4.jar \
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir "mlflow==2.9.2" "boto3>=1.28" "psycopg2-binary>=2.9"
 
+# PyTorch CPU + torchvision — cho benchmark "Single machine vs Spark cluster"
+# (src/benchmark/spark_vs_local.py): suy luận / huấn luyện DL trên cluster CPU.
+# Image chạy Python 3.8 → pin bản cao nhất còn hỗ trợ (wheel CPU-only ~190MB).
+RUN pip3 install --no-cache-dir \
+      torch==2.4.1 torchvision==0.19.1 \
+      --index-url https://download.pytorch.org/whl/cpu
+
 # apache/spark image mặc định chạy bằng user root trong compose; giữ nguyên.

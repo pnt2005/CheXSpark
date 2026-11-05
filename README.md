@@ -1103,8 +1103,89 @@ Response (`/predict`):
 - Model được giữ trong RAM + mọi lần suy luận đi qua **một lock** nên API an toàn
   khi Streamlit gọi song song; `/predict` chạy trong threadpool để không chặn event loop.
 
+## Benchmark: Single machine vs Spark cluster
+
+Đáp ứng mục 2.3 AGENTS.md — *“Đánh giá và so sánh hiệu năng giữa Single Machine và
+Spark Cluster (thời gian huấn luyện, throughput ảnh/giây, khả năng mở rộng)”*.
+**Cùng một workload** chạy trên 2 engine qua cùng một file
+`src/benchmark/spark_vs_local.py`:
+
+- **local** — máy dev 12 vCPU: pandas / PyTorch 2.15 CPU / scikit-learn,
+  1 process dùng toàn bộ core;
+- **spark** — cluster standalone trong docker-compose: **2 worker × 2 vCPU = 4 vCPU**
+  (cùng host với máy dev — không có cụm multi-node thật), PyTorch 2.4 CPU trong
+  executor (image Spark chạy Python 3.8 → bản torch cao nhất còn hỗ trợ).
+
+5 workload: ETL metadata Silver, preprocess ảnh (decode+resize), **suy luận
+DenseNet121 production** (nạp từ MLflow registry — cùng checkpoint với serving),
+**huấn luyện mini DenseNet121** (fwd+bwd thật, số bước hữu hạn), K-Means + PCA trên
+feature 1024-d (sklearn vs Spark MLlib).
+
+### Kết quả (11/2026 — `data/outputs/spark_vs_local_benchmark.json`)
+
+| Workload | Single machine (12 vCPU) | Spark cluster (2×2 vCPU) | Thắng |
+|---|---|---|---|
+| ETL metadata ×1 (112.120 dòng) | **0,59 s** (191k rows/s) | 18,25 s (6,1k rows/s, session 2,7 s)¹ | local ×31 |
+| ETL ×5 (560.600 dòng) | **0,38 s** | 8,48 s | local ×22 |
+| ETL ×10 (1.121.200 dòng) | **0,38 s** | 12,24 s | local ×32 |
+| Preprocess 2.000 ảnh (decode+resize) | **150,3 img/s** | 97,0 img/s | local ×1,5 |
+| **Suy luận DenseNet121 — 2.000 ảnh** | 7,7 img/s | **16,1 img/s** | **spark ×2,1** |
+| **Huấn luyện mini — 32 bước × batch4** | 0,48 steps/s (2 img/s) | **1,24 steps/s (5 img/s)** | **spark ×2,6** |
+| K-Means k=10 fit ×1 (2.000 dòng) | **0,45 s** | 29,16 s (lượt đầu)¹ | local ×65 |
+| K-Means k=10 fit ×5 (10.000 dòng) | **0,94 s** | 44,87 s | local ×48 |
+
+¹ Lượt chạy **đầu tiên** của cluster: cộng dồn SparkSession (2,7–2,9 s) + JIT + kết nối
+S3A — các workload chạy sau trong cùng phiên Spark không mất chi phí này.
+
+**Đáp án học được giống nhau ở cả 2 engine** (khác thời gian, không khác kết luận):
+inertia K-Means khớp 1.531.535 vs 1.533.655 (+0,14%) và 7.728.140 vs 7.778.411
+(+0,65% — khác biệt do init k-means++ ngẫu nhiên); 2 PC đầu của PCA = **18,7%**
+trùng khớp với kết quả MLlib ở mục 8.
+
+### Nhận xét
+
+1. **ETL / feature / clustering ở quy mô ≤1,1 triệu dòng: pandas + sklearn thắng đậm.**
+   Overhead Spark (session, task scheduling, shuffle 8 partition) chiếm đa số thời
+   gian — dữ liệu nhỏ nằm gọn trong RAM máy đơn. Spark phát huy khi dữ liệu vượt
+   RAM hoặc phân tán nhiều node; ở benchmark này cluster **cùng host**, tổng 4 vCPU
+   < 12 vCPU của máy đơn nên càng bất lợi cho Spark ở workload thiên I/O nhẹ.
+2. **Deep Learning là nơi Sparkcluster thắng** (suy luận ×2,1, huấn luyện ×2,6):
+   4 process × 2 thread vượt 1 process 12 hyper-thread — PyTorch intra-op threads
+   không nhân tuyến tính trên hyper-thread, còn Spark **scale-out theo process**:
+   thêm worker = thêm lõi tính toán thật. Đây chính là “khả năng mở rộng” theo
+   chiều ngang mà cluster mang lại (mỗi node mới = worker mới, benchmark này chưa
+   có để đo — kết luận giới hạn ở quy mô 1 node).
+3. **Preprocess ảnh**: local ×1,5 nhờ 12 process PIL vs 4 vCPU cluster.
+4. **Huấn luyện production không đặt trên Spark**: Stage-1/Stage-2 train trên
+   **T4 single-node Kaggle** (dice 0,9698 / mAUROC 0,8331 — mục 6b/6c); Spark cluster
+   ở đây CPU-only cùng máy nên không có lợi thế GPU. Benchmark “train” ở trên là
+   mini-loop đo **throughput CPU**, không phải thời gian train đầy đủ (~3,9 giờ
+   T4 cho 30 epoch 112k).
+5. Ghi chú kỹ thuật:
+   - PyTorch trong image Spark thêm ở `infra/spark/Dockerfile`
+     (`torch==2.4.1+cpu`, wheel ~190 MB) → `docker compose build spark-master`
+     rồi `docker compose up -d spark-master spark-worker-1 spark-worker-2`.
+   - WSL2 cần **`memory=12GB`** trong `%USERPROFILE%\.wslconfig` — trước đây trần
+     mặc định ~7,8 GB (50% RAM) bị 4 worker PyTorch vượt → OOM làm Docker API
+     trả 500; benchmark giữ batch vừa RAM (train batch4, infer batch16).
+   - Runner tự nạp creds MinIO từ `.env` và **đè** `AWS_ACCESS_KEY_ID` thật của
+     máy dev (nếu không, MinIO trả `InvalidAccessKeyId`).
+
+### Chạy lại
+
+```powershell
+python scripts/dev/benchmark_spark_vs_local.py --quick   # smoke ~2 phút
+python scripts/dev/benchmark_spark_vs_local.py           # full cả 2 engine ~13 phút
+python scripts/dev/benchmark_spark_vs_local.py --show    # in bảng từ JSON có sẵn
+python scripts/dev/benchmark_spark_vs_local.py --engine spark --workloads kmeans  # 1 phần (gộp vào JSON cũ)
+```
+
+Kết quả ghi `data/outputs/spark_vs_local_benchmark.json` (mỗi workload 1 dòng
+`RESULT_JSON:` → runner gộp theo khoá `workload`+`scale`, chạy partial không xoá
+số liệu cũ).
+
 ## Ghi chú
 
 - Bucket `mlflow` được tạo tự động bởi service `minio-init`; các bucket dữ liệu (`bronze`, `silver`, `gold`, `checx`) tạo qua MinIO console hoặc `mc`.
 - Credential MinIO được truyền vào Spark/MLflow qua biến môi trường `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — **không** hard-code trong code hay `spark-defaults.conf`.
-- Đảm cấp Docker Desktop có ≥ 8 GB RAM để chạy đủ 2 Spark workers (mỗi worker mặc định 4G, chỉnh trong `.env`).
+- Đảm bảo Docker Desktop có ≥ 8 GB RAM để chạy đủ 2 Spark workers (mỗi worker mặc định 4G, chỉnh trong `.env`); với WSL2 đặt `memory=12GB` trong `%USERPROFILE%\.wslconfig` (xem mục Benchmark) để tránh OOM khi chạy PyTorch trong executor.

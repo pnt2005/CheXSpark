@@ -385,8 +385,8 @@ Cùng notebook chạy qua `train_on_kaggle.py`, GT lấy từ **mask pack**
 | % ảnh Dice ≥ 0.7 | – | **99.76%** |
 
 - So với dev run: dice test **0.9461 → 0.9698 (+0.024)** — kéo theo gap mask suy
-  luận vs CheXmask khép lại (xem bảng benchmark mục Serving ở dưới: 0.8040/0.8034/
-  0.7987 so với đường train 0.8030).
+  luận vs CheXmask khép lại: **−0,0107 → −0,0039 trên full test 112k** (xem bảng
+  benchmark mục Serving ở dưới).
 - `load_stage1_model` **tự suy ra `base` từ checkpoint** (dev=16, production=32);
   registry log mô tả tập train theo metrics thật (`gt_source=mask_pack`).
 
@@ -990,6 +990,26 @@ khi đó cả 3 đường còn thấp hơn đường train 0,0107–0,0115). V�
 giữ Effusion (0,8715 ≈ 0,8771 tham chiếu) và Edema (0,9532 > tham chiếu); `none`
 nhỉnh hơn tổng thể nhưng mất ~0,04 ở Effusion. Chi tiết từng nhãn:
 `data/outputs/serving_mask_benchmark.json`.
+
+**Full test 112k — 16,730 ảnh (Kaggle T4, `scripts/kaggle/eval_stage2_masks.py`):**
+
+Số liệu chốt cho claim "serving ≈ train" (3 đường, cùng checkpoint Stage-2 v3,
+không TTA — cùng protocol máy host):
+
+| Đường mask | mAUROC | Δ so với đường train |
+|---|---|---|
+| `chexmask` — GT (đường train) | **0.8306** | — |
+| `scanline` — U-Net v2 + tim ước lượng (mặc định serving) | 0.8266 | **−0,0039** |
+| `none` — U-Net v2, không ước lượng tim | 0.8224 | −0,0082 |
+
+- **Gap −0,4 điểm % trên toàn bộ test** — nhất quán với dev 344 (−0,0043).
+- `scanline` > `none` ở **10/14 nhãn** trên mẫu lớn (đảo thứ tự dev 344 — 16,730 ảnh
+  tin cậy hơn): Cardiomegaly −0,014 vs −0,039, và nhiều nhãn còn **cao hơn** đường
+  train (Pneumonia +0,008, Edema/Mass/Hernia ~+0,001) → giữ `scanline` làm mặc định.
+- Nhãn nhạy mask nhất: Pleural_Thickening −0,021, Cardiomegaly −0,014, Effusion −0,013.
+- T4 ~7,5 phút (chexmask 85s + scanline 201s + none 168s); chạy lại:
+  `python scripts/kaggle/eval_masks_on_kaggle.py` (local smoke reproduce đúng
+  benchmark dev từng số). Kết quả: `data/outputs/stage2_mask_eval.json`.
 
 ```powershell
 python scripts/dev/benchmark_serving_mask.py            # full 344, ~4 phút CPU

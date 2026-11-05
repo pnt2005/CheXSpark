@@ -96,9 +96,16 @@ def build_unet(in_ch: int = 1, out_ch: int = 1, base: int = 16) -> nn.Module:
 
 
 def load_stage1_model(ckpt: str | Path, device: str = "cpu") -> nn.Module:
-    """Load state_dict U-Net Stage-1 (file `.pth` chỉ chứa state_dict)."""
-    model = build_unet()
+    """Load state_dict U-Net Stage-1 (file `.pth` chỉ chứa state_dict).
+
+    Tự suy ra `base` (số kênh tầng đầu) từ checkpoint — model dev train base=16,
+    model full 112k train base=32 → không được hardcode.
+    """
     state = torch.load(ckpt, map_location="cpu")
+    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+        state = state["model"]   # checkpoint resume (best + optimizer + epoch)
+    base = int(state["enc1.net.0.weight"].shape[0])
+    model = build_unet(base=base)
     model.load_state_dict(state)
     model.eval()
     return model.to(device)

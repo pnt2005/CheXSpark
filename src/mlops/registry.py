@@ -263,6 +263,16 @@ def register_stage2_model(
 # --------------------------------------------------------------------------- #
 # Stage-1: U-Net phân đoạn phổi
 # --------------------------------------------------------------------------- #
+def _describe_dataset(raw_metrics: dict) -> str:
+    """Mô tả tập train theo metrics thật (dev 2k hay full 112k) — tránh ghi sai metadata."""
+    cfg = raw_metrics.get("config") or {}
+    n_train = cfg.get("n_train")
+    gt_source = cfg.get("gt_source") or ("rle" if not cfg.get("masks_ds") else "mask_pack")
+    scope = "dev subset 2000 ảnh" if (not n_train or int(n_train) <= 2000) \
+        else f"full {int(n_train):,} ảnh train"
+    return f"NIH ChestX-ray14 ({scope}) + CheXmask ground truth (GT: {gt_source})"
+
+
 def register_stage1_model(
     ckpt: str | Path,
     metrics_json: str | Path | None = None,
@@ -294,7 +304,7 @@ def register_stage1_model(
         "in_channels": "1",
         "n_classes": "1 (phổi)",
         "img_size": str(IMG_SIZE),
-        "dataset": "NIH ChestX-ray14 (dev subset 2000 ảnh) + CheXmask ground truth",
+        "dataset": _describe_dataset(raw_metrics),
         "ground_truth": "CheXmask (left|right, không gồm heart)",
         "checkpoint": ckpt.name,
         "checkpoint_sha256": _sha256(ckpt),

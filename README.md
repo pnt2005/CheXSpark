@@ -333,8 +333,11 @@ gửi ảnh mới).
 # Train trên máy local (CPU) — dev subset
 python scripts/dev/train_stage1_unet.py --limit 500 --epochs 12
 
-# Train đầy đủ trên GPU: dùng notebook Kaggle
-#   notebooks/kaggle/stage1_unet_segmentation.ipynb  (base=32, 30 epoch)
+# Train đầy đủ trên GPU (112k, GT lấy từ mask pack — không decode RLE):
+python scripts/kaggle/train_on_kaggle.py --stage 1 `
+  --dataset-slug chexspark-stage2-nih-112k `
+  --masks-dataset pnt2005/chexspark-masks-224-112k `
+  --epochs 12 --batch-size 32 --install
 ```
 
 Đánh giá so với mask CheXmask trên tập test (Dice/IoU từng ảnh + 4 ca tệ nhất):
@@ -365,6 +368,27 @@ Output: `notebooks/kaggle/best_stage1_unet.pth` + `stage1_metrics.json`.
   mất hẳn một bên phổi → xem `data/outputs/stage1/stage1_worst_test.png`
 - Model đã đăng ký MLflow Registry: `chexspark-stage1-unet` version 1, alias
   `production` (verify logits khớp file local, lệch 0.0)
+
+**Train full 112k — production (version 2, alias `production`):**
+
+Cùng notebook chạy qua `train_on_kaggle.py`, GT lấy từ **mask pack**
+(`MASKS_DS=pnt2005/chexspark-masks-224-112k`, bỏ decode RLE): 77,728 train /
+17,662 val / 16,730 test, base=32, 12 epoch, batch 32 — ~2.8 GPU-giờ T4
+(epoch 1: 77 phút gồm warm-up, các epoch sau ~12 phút):
+
+| Chỉ số | Val (17,662) | Test (16,730) |
+|---|---|---|
+| Dice mean | 0.9681 | **0.9698** |
+| Dice median | – | 0.9803 |
+| Dice p10 (ca khó nhất) | – | 0.9415 |
+| IoU mean | 0.9401 | 0.9431 |
+| % ảnh Dice ≥ 0.7 | – | **99.76%** |
+
+- So với dev run: dice test **0.9461 → 0.9698 (+0.024)** — kéo theo gap mask suy
+  luận vs CheXmask khép lại (xem bảng benchmark mục Serving ở dưới: 0.8040/0.8034/
+  0.7987 so với đường train 0.8030).
+- `load_stage1_model` **tự suy ra `base` từ checkpoint** (dev=16, production=32);
+  registry log mô tả tập train theo metrics thật (`gt_source=mask_pack`).
 
 **Ablation — thay CheXmask bằng mask U-Net thì Stage-2 có tụt không?**
 (`scripts/dev/compare_mask_sources.py`, chạy DenseNet121 2 lượt trên cùng tập test)
@@ -956,13 +980,16 @@ Hệ thống suy luận 3 giai đoạn đóng gói thành 2 service dùng chung 
 | Đường suy luận | mAUROC | Δ so với train |
 |---|---|---|
 | `chexmask` — mask thật (đường train) | **0.8030** | — |
-| `scanline` — U-Net + tim ước lượng (mặc định serving) | **0.7923** | **−0,0107** |
-| `none` — U-Net, không ước lượng tim | 0.7920 | −0,0110 |
-| `closing` — U-Net + đóng morphology | 0.7915 | −0,0115 |
+| `none` — U-Net, không ước lượng tim | **0.8040** | **+0,0010** |
+| `closing` — U-Net + đóng morphology | 0.8034 | +0,0003 |
+| `scanline` — U-Net + tim ước lượng (mặc định serving) | 0.7987 | −0,0043 |
 
-Dice U-Net vs CheXmask trên chính 344 ảnh: **0,9461**. Với `scanline`, Cardiomegaly
-(0,9309) và Edema (0,9532) còn **cao hơn** đường tham chiếu — mất tập trung ở
-Effusion/Fibrosis. Kết quả chi tiết từng nhãn: `data/outputs/serving_mask_benchmark.json`.
+Dice U-Net vs CheXmask trên chính 344 ảnh: **0,9681** (U-Net v1 dev: 0,9461 —
+khi đó cả 3 đường còn thấp hơn đường train 0,0107–0,0115). Với U-Net v2 (train full 112k), **cả 3
+đường suy luận nằm trong nhiễu ±0,005 của đường train**. `scanline` vẫn là mặc định:
+giữ Effusion (0,8715 ≈ 0,8771 tham chiếu) và Edema (0,9532 > tham chiếu); `none`
+nhỉnh hơn tổng thể nhưng mất ~0,04 ở Effusion. Chi tiết từng nhãn:
+`data/outputs/serving_mask_benchmark.json`.
 
 ```powershell
 python scripts/dev/benchmark_serving_mask.py            # full 344, ~4 phút CPU

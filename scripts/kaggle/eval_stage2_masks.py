@@ -328,7 +328,8 @@ def main() -> None:
             if mode == "chexmask":
                 lung, heart = gt_lung, gt_heart_b
             else:
-                lung = (torch.sigmoid(unet((g - 0.5) / 0.5)) > 0.5).float()
+                gd = g.to(device, non_blocking=True)       # U-Net đang ở CUDA
+                lung = (torch.sigmoid(unet((gd - 0.5) / 0.5)) > 0.5).float().cpu()
                 if mode == "scanline":
                     heart = torch.from_numpy(np.stack([
                         heart_scanline(lung[i, 0].numpy()) for i in range(lung.shape[0])
